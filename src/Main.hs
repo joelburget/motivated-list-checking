@@ -34,23 +34,23 @@ instance Semigroup SListLength where
 instance Monoid SListLength where
   mempty = SListLength 0
 
-newtype SAll = SAll { unSAll :: SBV Bool }
+newtype SOr = SOr { unSAll :: SBV Bool }
   deriving Show
 
-instance Semigroup SAll where
-  SAll x <> SAll y = SAll (x &&& y)
+instance Semigroup SOr where
+  SOr x <> SOr y = SOr (x &&& y)
 
-instance Monoid SAll where
-  mempty = SAll true
+instance Monoid SOr where
+  mempty = SOr true
 
-newtype SAny = SAny { unSAny :: SBV Bool }
+newtype SAnd = SAnd { unSAnd :: SBV Bool }
   deriving Show
 
-instance Semigroup SAny where
-  SAny x <> SAny y = SAny (x ||| y)
+instance Semigroup SAnd where
+  SAnd x <> SAnd y = SAnd (x ||| y)
 
-instance Monoid SAny where
-  mempty = SAny false
+instance Monoid SAnd where
+  mempty = SAnd false
 
 data SCmp = SCmp Ordering (SBV Integer)
   deriving Show
@@ -121,8 +121,8 @@ data Expr ty where
 data ListInfo a where
   LitList :: [SBV (Concrete a)] -> ListInfo a
   LenInfo :: SListLength        -> ListInfo a
-  AllInfo :: SAll               -> ListInfo a
-  AnyInfo :: SAny               -> ListInfo a
+  OrInfo  :: SOr                -> ListInfo a
+  AndInfo :: SAnd               -> ListInfo a
   CmpInfo :: SCmp               -> ListInfo a
   deriving Show
 
@@ -254,7 +254,7 @@ evalMotive' (MAnd f) = \case
   ListMap _ g lst -> evalMotive' (MAnd (f . g)) lst
   ListAt{} -> error "nested lists not allowed"
   ListInfo i -> case i of
-    AllInfo (SAll b) -> constrain $ error "TODO"
+    OrInfo (SOr b) -> constrain $ error "TODO"
     -- constrain $ foldr (&&&) true (f . literal <$> lst)
     -- traverse (constrain . f . literal) lst >> pure ()
     _ -> error $ "sorry, can't help with this motive: " ++ show i
@@ -324,15 +324,15 @@ main = do
     in len .== 6
 
   print <=< prove $ unSAll $ unFoldedList $
-    implode $ SAll . (.> 0) <$> [ 1, 2, 3 :: SBV Integer ]
+    implode $ SOr . (.> 0) <$> [ 1, 2, 3 :: SBV Integer ]
 
   print <=< prove $ unSAll $ unFoldedList $
-    implode $ SAll . (.> 0) <$> [ -1, 2, 3 :: SBV Integer ]
+    implode $ SOr . (.> 0) <$> [ -1, 2, 3 :: SBV Integer ]
 
   print <=< prove $ do
     a <- sInteger "a"
     pure $ unSAll $ unFoldedList $
-      implode $ SAll . (.> 0) <$> [ a, 2, 3 :: SBV Integer ]
+      implode $ SOr . (.> 0) <$> [ a, 2, 3 :: SBV Integer ]
 
   print <=< prove $ do
     [a, b] <- sIntegers ["a", "b"]
@@ -377,15 +377,15 @@ main = do
     evalMotive true $ Not $ ListAnd $ ListInfo $ LenInfo $ SListLength 0
 
   makeReport "(and [true]) == true (expect good)" $
-    evalMotive true $       ListAnd $ ListInfo $ AllInfo $ SAll true
+    evalMotive true $       ListAnd $ ListInfo $ OrInfo $ SOr true
       -- Lit [true]
 
   makeReport "(and [false]) == true (expect bad)" $
-    evalMotive true $       ListAnd $ ListInfo $ AllInfo $ SAll false
+    evalMotive true $       ListAnd $ ListInfo $ OrInfo $ SOr false
       -- Lit [false]
 
   makeReport "(not (and [false])) == true (expect good)" $
-    evalMotive true $ Not $ ListAnd $ ListInfo $ AllInfo $ SAll false
+    evalMotive true $ Not $ ListAnd $ ListInfo $ OrInfo $ SOr false
       -- Lit [false]
 
   makeReport "true (expect good)"  $
