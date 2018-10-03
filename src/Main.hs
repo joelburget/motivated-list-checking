@@ -106,7 +106,6 @@ data Expr ty where
            ->                   Expr ('List a) -> Expr ('List b)
 
   -- producers
-  Sym      :: SBV (Concrete a)                 -> Expr a
   ListInfo :: ListInfo a                       -> Expr a
 
   -- other
@@ -177,7 +176,6 @@ instance Show (Expr ty) where
       showString " " .
       showsPrec 10 b
     Not a              -> showString "Not" . showsPrec 10 a
-    Sym _              -> showString "Sym _"
 
 eval :: Expr ty -> Concrete ty
 eval = \case
@@ -199,7 +197,6 @@ eval = \case
   Not a              -> not (eval a)
   LitB a             -> a
   LitI a             -> a
-  Sym _              -> error "cannot evaluate symbolic value"
 
 sEval :: SymWord (Concrete ty) => Expr ty -> SBV (Concrete ty)
 sEval = \case
@@ -221,7 +218,6 @@ sEval = \case
   Not a          -> bnot (sEval a)
   LitB a         -> literal a
   LitI a         -> literal a
-  Sym a          -> a
 
 -- "My claim is that we should exploit a hypothesis not in terms of its
 -- immediate consequences, but in terms of the leverage it exerts on an
@@ -251,7 +247,6 @@ evalMotive' (Length len) = \case
   ListInfo i -> case i of
     LenInfo (SListLength len') -> constrain $ len' .== len
     _                          -> error $ "sorry, can't help with this motive: " ++ show i
-  Sym lst     -> constrain $ SBVL.length lst .== len
 evalMotive' (MAnd f) = \case
   ListCat a b -> do
     evalMotive' (MAnd f) a
@@ -263,9 +258,6 @@ evalMotive' (MAnd f) = \case
     -- constrain $ foldr (&&&) true (f . literal <$> lst)
     -- traverse (constrain . f . literal) lst >> pure ()
     _ -> error $ "sorry, can't help with this motive: " ++ show i
-  Sym lst -> do
-    i <- forall "i"
-    constrain $ i .>= 0 &&& i .< SBVL.length lst ==> f (lst .!! i)
 evalMotive' (MOr f) = \case
   ListCat a b -> do
     evalMotive' (MOr f) a
@@ -274,9 +266,6 @@ evalMotive' (MOr f) = \case
   ListAt{} -> error "nested lists not allowed"
   ListInfo lst  -> error "TODO"
     -- constrain $ foldr (|||) false (f . literal <$> lst)
-  Sym lst -> do
-    i <- exists "i"
-    constrain $ i .>= 0 &&& i .< SBVL.length lst ==> f (lst .!! i)
 evalMotive' (MEq lst) = \case
   ListCat a b -> constrain $ sEval a .++ sEval b .== sEval lst
   ListMap{} -> error "XXX tricky"
@@ -285,7 +274,6 @@ evalMotive' (MEq lst) = \case
     -- do
     -- ifor_ litLst $ \i val -> constrain $
     --   sEval lst .!! fromIntegral i .== literal val
-  Sym _       -> error "can't eliminate a symbolic list 2"
 evalMotive' (MAt i a) = \case
   ListCat l1 l2 -> do
     let l1' = sEval l1
@@ -298,7 +286,6 @@ evalMotive' (MAt i a) = \case
   ListInfo litLst -> error "TODO"
   -- ifor_ litLst $ \j val -> constrain $
   --   fromIntegral j .== i ==> literal val .== a
-  Sym _ -> error "can't eliminate a symbolic list 3"
 evalMotive' motive@(MContains a) = \case
   ListCat l1 l2 -> do
     evalMotive' motive l1
@@ -308,7 +295,6 @@ evalMotive' motive@(MContains a) = \case
   ListInfo litLst -> error "TODO"
   -- for_ litLst $ \val -> constrain $
   --   literal val .== a
-  Sym _ -> error "TODO"
 
 evalMotive :: Suitable ty => SBV (Concrete ty) -> Expr ty -> Symbolic ()
 evalMotive motive = \case
@@ -351,7 +337,7 @@ main = do
   print <=< prove $ do
     [a, b] <- sIntegers ["a", "b"]
     let l :: Expr ('List 'IntTy)
-        l = Sym (SBVL.implode [a, b])
+        l = ListInfo (LenInfo (SListLength 2))
     pure $ sEval $ Eq (LitI 2) (ListLen l)
 
   makeReport "length [] == 0 (expect good)" $ do
