@@ -34,6 +34,14 @@ instance Semigroup SListLength where
 instance Monoid SListLength where
   mempty = SListLength 0
 
+-- Just use SOr if you need a boolean predicate
+data SAny = SAny (SBV Integer) Ordering
+  deriving Show
+
+-- Just use SAnd if you need a boolean predicate
+data SAll = SAll (SBV Integer) Ordering
+  deriving Show
+
 newtype SOr = SOr { unSAll :: SBV Bool }
   deriving Show
 
@@ -121,6 +129,8 @@ data Expr ty where
 data ListInfo a where
   LitList :: [SBV (Concrete a)] -> ListInfo a
   LenInfo :: SListLength        -> ListInfo a
+  AnyInfo :: SAny               -> ListInfo a
+  AllInfo :: SAll               -> ListInfo a
   OrInfo  :: SOr                -> ListInfo a
   AndInfo :: SAnd               -> ListInfo a
   CmpInfo :: SCmp               -> ListInfo a
@@ -334,11 +344,11 @@ main = do
     pure $ unSAll $ unFoldedList $
       implode $ SOr . (.> 0) <$> [ a, 2, 3 :: SBV Integer ]
 
-  print <=< prove $ do
-    [a, b] <- sIntegers ["a", "b"]
-    let l :: Expr ('List 'IntTy)
-        l = ListInfo (LenInfo (SListLength 2))
-    pure $ sEval $ Eq (LitI 2) (ListLen l)
+  -- TODO
+  -- print <=< prove $ do
+  --   let l :: Expr ('List 'IntTy)
+  --       l = ListInfo (LenInfo (SListLength 2))
+  --   pure $ sEval $ Eq (LitI 2) (ListLen l)
 
   makeReport "length [] == 0 (expect good)" $ do
     let lst = ListInfo (LenInfo (SListLength 0)) :: Expr ('List 'IntTy)
