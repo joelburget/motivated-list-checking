@@ -345,8 +345,8 @@ evalMotive motive expr = case expr of
   ListAt lst i       -> evalMotive' (MAt i motive) lst
   ListContains lst a -> evalMotive' (MContains a) lst
 
-  Not (ListAnd lst)  -> bnot <$> evalMotive motive expr
-  Not (ListOr  lst)  -> bnot <$> evalMotive motive expr
+  Not (ListAnd lst)  -> bnot <$> evalMotive motive (ListAnd lst)
+  Not (ListOr  lst)  -> bnot <$> evalMotive motive (ListOr  lst)
   other -> error $ show other
 
 main :: IO ()
