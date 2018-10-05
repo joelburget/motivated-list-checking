@@ -1,26 +1,26 @@
-{-# language ConstraintKinds    #-}
-{-# language TypeOperators    #-}
-{-# language ScopedTypeVariables    #-}
-{-# language FlexibleContexts    #-}
-{-# language LambdaCase    #-}
-{-# language KindSignatures    #-}
-{-# language TypeFamilies    #-}
-{-# language DataKinds    #-}
-{-# language GADTs    #-}
-{-# language DeriveFunctor    #-}
-{-# language NamedFieldPuns    #-}
-{-# language OverloadedStrings #-}
-{-# language TypeSynonymInstances #-}
-{-# language FlexibleInstances #-}
+{-# LANGUAGE ConstraintKinds      #-}
+{-# LANGUAGE DataKinds            #-}
+{-# LANGUAGE DeriveFunctor        #-}
+{-# LANGUAGE FlexibleContexts     #-}
+{-# LANGUAGE FlexibleInstances    #-}
+{-# LANGUAGE GADTs                #-}
+{-# LANGUAGE KindSignatures       #-}
+{-# LANGUAGE LambdaCase           #-}
+{-# LANGUAGE NamedFieldPuns       #-}
+{-# LANGUAGE OverloadedStrings    #-}
+{-# LANGUAGE ScopedTypeVariables  #-}
+{-# LANGUAGE TypeFamilies         #-}
+{-# LANGUAGE TypeOperators        #-}
+{-# LANGUAGE TypeSynonymInstances #-}
 module Main where
 
-import Control.Monad ((<=<))
-import Prelude as P hiding (concat)
-import Data.SBV
-import           Data.SBV.List ((.++), (.!!))
+import           Control.Monad ((<=<))
+import           Data.SBV
+import           Data.SBV.List ((.!!), (.++))
 import qualified Data.SBV.List as SBVL
+import           Prelude       as P hiding (concat)
 
-import Debug.Trace
+import           Debug.Trace
 
 
 -- A list represented as the result of a fold
