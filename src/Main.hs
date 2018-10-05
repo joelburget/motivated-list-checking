@@ -14,6 +14,7 @@
 {-# language FlexibleInstances #-}
 module Main where
 
+import Control.Monad ((<=<))
 import Prelude as P hiding (concat)
 import Data.SBV
 import           Data.SBV.List ((.++), (.!!))
@@ -246,76 +247,76 @@ sEval = \case
 
 -- The motive for consuming a list of type @a@
 data Motive a where
-  Length    :: Expr 'IntTy                                  -> Motive a
-  MAnd      :: (Expr a -> Expr 'BoolTy)                     -> Motive a
-  MOr       :: (Expr a -> Expr 'BoolTy)                     -> Motive a
-  -- MAnd      :: (SBV (Concrete a) -> SBV (Concrete 'BoolTy)) -> Motive a
-  -- MOr       :: (SBV (Concrete a) -> SBV (Concrete 'BoolTy)) -> Motive a
-  MEq       :: Expr ('List a)                               -> Motive a
-  MAt       :: Expr 'IntTy -> Expr a                        -> Motive a
-  MContains ::                                    Expr a    -> Motive a
+  Length    :: Expr 'IntTy              -> Motive a
+  MAnd      :: (Expr a -> Expr 'BoolTy) -> Motive a
+  MOr       :: (Expr a -> Expr 'BoolTy) -> Motive a
+  MEq       :: Expr ('List a)           -> Motive a
+  MAt       :: Expr 'IntTy -> Expr a    -> Motive a
+  MContains :: Expr a                   -> Motive a
   -- MFold
 
 evalMotive'
   :: forall a. (Show (Concrete a), SymWord (Concrete a))
-  => (SBV Bool -> Symbolic ()) -> Motive a -> Expr ('List a) -> Symbolic ()
-evalMotive' constrain' (Length len) = \case
+  => Motive a -> Expr ('List a) -> Symbolic (SBV Bool)
+evalMotive' (Length len) = \case
   ListCat a b -> do
     [al, bl] <- sIntegers ["al", "bl"]
-    constrain $ al + bl .== sEval len
-    evalMotive' constrain' (Length (Sym al)) a
-    evalMotive' constrain' (Length (Sym bl)) b
-  ListMap _ lst -> evalMotive' constrain' (Length len) lst
+    let totalLen = al + bl .== sEval len
+    aLen <- evalMotive' (Length (Sym al)) a
+    bLen <- evalMotive' (Length (Sym bl)) b
+    pure $ totalLen &&& aLen &&& bLen
+  ListMap _ lst -> evalMotive' (Length len) lst
   ListAt{} -> error "nested lists not allowed"
   ListInfo i -> case i of
-    LenInfo (SListLength len') -> constrain $ len' .== sEval len
+    LenInfo (SListLength len') -> pure $ len' .== sEval len
     _                          -> error $ "sorry, can't help with this motive: " ++ show i
-evalMotive' constrain' (MAnd f) = \case
-  ListCat a b -> do
-    evalMotive' constrain' (MAnd f) a
-    evalMotive' constrain' (MAnd f) b
-  ListMap g lst -> evalMotive' constrain' (MAnd (f . g)) lst
+evalMotive' (MAnd f) = \case
+  ListCat a b -> (&&&)
+    <$> evalMotive' (MAnd f) a
+    <*> evalMotive' (MAnd f) b
+  ListMap g lst -> evalMotive' (MAnd (f . g)) lst
   ListAt{} -> error "nested lists not allowed"
   ListInfo i -> case i of
-    AndInfo (SAnd b) -> constrain $ sEval $ f $ Sym b
-    -- constrain $ foldr (&&&) true (f . literal <$> lst)
-    -- traverse (constrain . f . literal) lst >> pure ()
+    AndInfo (SAnd b) -> pure $ sEval $ f $ Sym b
     CmpInfo (SCmp g) -> do
+      -- g is at least as strong an assumption as f.
+      -- example:
+      -- f: for all i: elements of the list, i > 0
+      -- g: i need to know that for all i: elements of the list, i > -1
       i <- forall "i"
-      constrain $ sEval $ f $ Sym i
-      constrain $ g i
+      let fEval = sEval $ f $ Sym i
+          gEval =         g       i
+      pure $ gEval ==> fEval
     LenInfo (SListLength len)
-      | Just 0 <- unliteral len -> pure ()
+      | Just 0 <- unliteral len -> pure true
       | otherwise -> error "TODO"
     _ -> error $ "sorry, can't help with this motive: " ++ show i
-evalMotive' constrain' (MOr f) = \case
-  ListCat a b -> do
-    -- XXX need to add an OR here
-    evalMotive' constrain' (MOr f) a
-    evalMotive' constrain' (MOr f) b
-  ListMap g lst -> evalMotive' constrain' (MOr (f . g)) lst
+evalMotive' (MOr f) = \case
+  ListCat a b -> (|||)
+    <$> evalMotive' (MOr f) a
+    <*> evalMotive' (MOr f) b
+  ListMap g lst -> evalMotive' (MOr (f . g)) lst
   ListAt{} -> error "nested lists not allowed"
   ListInfo info -> case info of
     LenInfo (SListLength len)
-      | Just 0 <- unliteral len -> constrain false
+      | Just 0 <- unliteral len -> pure false
       | otherwise -> error "TODO"
     info -> error $ "sorry, can't help with this motive: " ++ show info
-    -- constrain $ foldr (|||) false (f . literal <$> lst)
-evalMotive' constrain' (MEq lst) = \case
-  ListCat a b -> constrain $ sEval a .++ sEval b .== sEval lst
+evalMotive' (MEq lst) = \case
+  ListCat a b -> pure $ sEval a .++ sEval b .== sEval lst
   ListMap{} -> error "XXX tricky"
   ListAt{} -> error "nested lists not allowed"
   ListInfo litLst  -> error "TODO"
     -- do
     -- ifor_ litLst $ \i val -> constrain $
     --   sEval lst .!! fromIntegral i .== literal val
-evalMotive' constrain' (MAt i a) = \case
+evalMotive' (MAt i a) = \case
   ListCat l1 l2 -> do
     let l1' = sEval l1
         l2' = sEval l2
         i'  = sEval i
         a'  = sEval a
-    constrain $
+    pure $
       l1' .!! i'                     .== a' |||
       l2' .!! (i' - SBVL.length l1') .== a'
   ListMap{} -> error "XXX tricky 3"
@@ -323,29 +324,29 @@ evalMotive' constrain' (MAt i a) = \case
   ListInfo litLst -> error "TODO"
   -- ifor_ litLst $ \j val -> constrain $
   --   fromIntegral j .== i ==> literal val .== a
-evalMotive' constrain' motive@(MContains a) = \case
-  ListCat l1 l2 -> do
-    -- XXX need to add an OR here somehow
-    evalMotive' constrain' motive l1
-    evalMotive' constrain' motive l2
+evalMotive' motive@(MContains a) = \case
+  ListCat l1 l2 -> (|||)
+    <$> evalMotive' motive l1
+    <*> evalMotive' motive l2
   ListMap{} -> error "XXX tricky 4"
   ListAt{} -> error "nested lists not allowed"
   ListInfo litLst -> error "TODO"
   -- for_ litLst $ \val -> constrain $
   --   literal val .== a
 
-evalMotive :: Suitable ty => (SBV Bool -> Symbolic ()) -> Expr ty -> Expr ty -> Symbolic ()
-evalMotive constrain' motive expr = case expr of
-  ListLen lst        -> evalMotive' constrain' (Length motive) lst
-  ListAnd lst        -> evalMotive' constrain' (MAnd (Eq motive)) lst
-  ListOr  lst        -> evalMotive' constrain' (MOr  (Eq motive)) lst
-  ListEq a b         -> evalMotive' constrain' (MEq a) b -- XXX use motive
-  ListAt lst i       -> evalMotive' constrain' (MAt i motive) lst
-  ListContains lst a -> evalMotive' constrain' (MContains a) lst
+evalMotive
+  :: Suitable ty
+  => Expr ty -> Expr ty -> Symbolic (SBV Bool)
+evalMotive motive expr = case expr of
+  ListLen lst        -> evalMotive' (Length motive) lst
+  ListAnd lst        -> evalMotive' (MAnd (Eq motive)) lst
+  ListOr  lst        -> evalMotive' (MOr  (Eq motive)) lst
+  ListEq a b         -> evalMotive' (MEq a) b -- XXX use motive
+  ListAt lst i       -> evalMotive' (MAt i motive) lst
+  ListContains lst a -> evalMotive' (MContains a) lst
 
-  -- XXX map not
-  Not (ListAnd lst)  -> evalMotive (constrain' . bnot) motive expr
-  Not (ListOr  lst)  -> evalMotive (constrain' . bnot) motive expr
+  Not (ListAnd lst)  -> bnot <$> evalMotive motive expr
+  Not (ListOr  lst)  -> bnot <$> evalMotive motive expr
   other -> error $ show other
 
 main :: IO ()
@@ -384,7 +385,7 @@ main = do
 
   makeReport "length [] == 0 (expect good)" $ do
     let lst = ListInfo (LenInfo (SListLength 0)) :: Expr ('List 'IntTy)
-    evalMotive constrain (LitI 0) (ListLen lst)
+    constrain =<< evalMotive (LitI 0) (ListLen lst)
 
   -- proveWith z3 {verbose=True}
 
@@ -393,7 +394,7 @@ main = do
     let expr  = ListInfo (CmpInfo (SCmp (.> 0))) :: Expr ('List 'IntTy)
         expr' = ListAnd (ListMap (Gt (LitI 0)) expr)
 
-    evalMotive constrain true' expr'
+    constrain =<< evalMotive true' expr'
 
 --   -- should falsify the assertion
 --   makeReport "fmap (> 0) lst == true (false)" $ do
@@ -410,24 +411,24 @@ main = do
 --     let expr  = Sym lst :: Expr ('List 'IntTy)
 --         expr' = ListAnd (ListMap (Gt (LitI 0)) expr)
 
---     evalMotive constrain true expr'
+--     constrain =<< evalMotive true expr'
 
   makeReport "(and []) == true (expect good)" $
-    evalMotive constrain true' $       ListAnd $ ListInfo $ LenInfo $ SListLength 0
+    constrain <=< evalMotive true' $       ListAnd $ ListInfo $ LenInfo $ SListLength 0
 
   makeReport "(not (and [])) == true (expect bad)" $
-    evalMotive constrain true' $ Not $ ListAnd $ ListInfo $ LenInfo $ SListLength 0
+    constrain <=< evalMotive true' $ Not $ ListAnd $ ListInfo $ LenInfo $ SListLength 0
 
   makeReport "(and [true]) == true (expect good)" $
-    evalMotive constrain true' $       ListAnd $ ListInfo $ AndInfo $ SAnd true
+    constrain <=< evalMotive true' $       ListAnd $ ListInfo $ AndInfo $ SAnd true
       -- Lit [true]
 
   makeReport "(and [false]) == true (expect bad)" $
-    evalMotive constrain true' $       ListAnd $ ListInfo $ AndInfo $ SAnd false
+    constrain <=< evalMotive true' $       ListAnd $ ListInfo $ AndInfo $ SAnd false
       -- Lit [false]
 
   makeReport "(not (and [false])) == true (expect good)" $
-    evalMotive constrain true' $ Not $ ListAnd $ ListInfo $ AndInfo $ SAnd false
+    constrain <=< evalMotive true' $ Not $ ListAnd $ ListInfo $ AndInfo $ SAnd false
       -- Lit [false]
 
 true', false' :: Expr 'BoolTy
