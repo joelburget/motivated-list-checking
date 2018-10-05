@@ -283,7 +283,7 @@ evalMotive' (MAnd f) = \case
       -- example:
       -- f: for all i: elements of the list, i > 0
       -- g: i need to know that for all i: elements of the list, i > -1
-      i <- forall "i"
+      i <- forall_
       let fEval = sEval $ f $ Sym i
           gEval =         g       i
       pure $ gEval ==> fEval
