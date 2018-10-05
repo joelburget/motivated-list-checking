@@ -15,7 +15,6 @@
 module Main where
 
 import Prelude as P hiding (concat)
-import Control.Monad
 import Data.SBV
 import           Data.SBV.List ((.++), (.!!))
 import qualified Data.SBV.List as SBVL
@@ -60,8 +59,10 @@ instance Semigroup SAnd where
 instance Monoid SAnd where
   mempty = SAnd false
 
-data SCmp = SCmp Ordering (SBV Integer)
-  deriving Show
+data SCmp = SCmp (SBV Integer -> SBV Bool) -- Ordering (SBV Integer)
+
+instance Show SCmp where
+  show _ = "SCmp"
 
 -- TODO: contains monoid
 
@@ -109,12 +110,11 @@ data Expr ty where
   ListCat  :: Suitable a
            => Expr ('List a) -> Expr ('List a) -> Expr ('List a)
   ListMap  :: Suitable a
-           => (     Concrete a  ->      Concrete b)
-           -> (SBV (Concrete a) -> SBV (Concrete b))
+           => (Expr a -> Expr b)
            ->                   Expr ('List a) -> Expr ('List b)
 
   -- producers
-  ListInfo :: ListInfo a                       -> Expr a
+  ListInfo :: ListInfo a                       -> Expr ('List a)
 
   -- other
   LitB     :: Concrete 'BoolTy                 -> Expr 'BoolTy
@@ -125,23 +125,31 @@ data Expr ty where
   And      :: Expr 'BoolTy   -> Expr 'BoolTy   -> Expr 'BoolTy
   Or       :: Expr 'BoolTy   -> Expr 'BoolTy   -> Expr 'BoolTy
   Not      ::                   Expr 'BoolTy   -> Expr 'BoolTy
+  Sym :: SBV (Concrete a) -> Expr a
 
 data ListInfo a where
   LitList :: [SBV (Concrete a)] -> ListInfo a
   LenInfo :: SListLength        -> ListInfo a
-  AnyInfo :: SAny               -> ListInfo a
-  AllInfo :: SAll               -> ListInfo a
-  OrInfo  :: SOr                -> ListInfo a
-  AndInfo :: SAnd               -> ListInfo a
-  CmpInfo :: SCmp               -> ListInfo a
-  deriving Show
+  -- AnyInfo :: SAny               -> ListInfo 'IntTy
+  -- AllInfo :: SAll               -> ListInfo 'IntTy
+  OrInfo  :: SOr                -> ListInfo 'BoolTy
+  AndInfo :: SAnd               -> ListInfo 'BoolTy
+  CmpInfo :: SCmp               -> ListInfo 'IntTy
+
+instance Show (ListInfo a) where
+  showsPrec p li = showParen (p > 10) $ case li of
+    LitList l -> showString "LitList " . showsPrec 10 l
+    LenInfo i -> showString "LenInfo " . showsPrec 10 i
+    OrInfo  i -> showString "OrInfo "  . showsPrec 10 i
+    AndInfo i -> showString "AndInfo " . showsPrec 10 i
+    CmpInfo i -> showString "CmpInfo " . showsPrec 10 i
 
 instance Show (Expr ty) where
   showsPrec p expr = showParen (p > 10) $ case expr of
-    ListLen l          -> showString "ListLen" . showsPrec 10 l
-    ListAnd l          -> showString "ListAnd" . showsPrec 10 l
-    ListOr  l          -> showString "ListOr" . showsPrec 10 l
-    ListEq  a b        -> showString "ListEq" . showsPrec 10 a . showsPrec 10 b
+    ListLen l          -> showString "ListLen " . showsPrec 10 l
+    ListAnd l          -> showString "ListAnd " . showsPrec 10 l
+    ListOr  l          -> showString "ListOr " . showsPrec 10 l
+    ListEq  a b        -> showString "ListEq " . showsPrec 10 a . showsPrec 10 b
     ListAt lst i       ->
       showString "ListAt " .
       showsPrec 10 lst .
@@ -158,8 +166,8 @@ instance Show (Expr ty) where
       showsPrec 10 a .
       showString " " .
       showsPrec 10 b
-    ListMap _ _ as     ->
-      showString "ListMap _ _ " .
+    ListMap _ as     ->
+      showString "ListMap _ " .
       showsPrec 10 as
     ListInfo i         -> showString "ListInfo " . showsPrec 10 i
 
@@ -186,6 +194,7 @@ instance Show (Expr ty) where
       showString " " .
       showsPrec 10 b
     Not a              -> showString "Not" . showsPrec 10 a
+    Sym a -> showsPrec 10 a
 
 eval :: Expr ty -> Concrete ty
 eval = \case
@@ -197,7 +206,8 @@ eval = \case
   ListContains lst a -> eval a `elem` eval lst
 
   ListCat a b        -> eval a <> eval b
-  ListMap f _ as     -> f <$> eval as
+  -- Pending lit / injection
+  -- ListMap f as       -> eval . f . lit <$> eval as
   ListInfo _         -> error "cannot evaluate list info"
 
   Eq a b             -> eval a == eval b
@@ -228,6 +238,7 @@ sEval = \case
   Not a          -> bnot (sEval a)
   LitB a         -> literal a
   LitI a         -> literal a
+  Sym a          -> a
 
 -- "My claim is that we should exploit a hypothesis not in terms of its
 -- immediate consequences, but in terms of the leverage it exerts on an
@@ -235,48 +246,62 @@ sEval = \case
 
 -- The motive for consuming a list of type @a@
 data Motive a where
-  Length    :: SBV (Concrete 'IntTy)                        -> Motive a
-  MAnd      :: (SBV (Concrete a) -> SBV (Concrete 'BoolTy)) -> Motive a
-  MOr       :: (SBV (Concrete a) -> SBV (Concrete 'BoolTy)) -> Motive a
+  Length    :: Expr 'IntTy                                  -> Motive a
+  MAnd      :: (Expr a -> Expr 'BoolTy)                     -> Motive a
+  MOr       :: (Expr a -> Expr 'BoolTy)                     -> Motive a
+  -- MAnd      :: (SBV (Concrete a) -> SBV (Concrete 'BoolTy)) -> Motive a
+  -- MOr       :: (SBV (Concrete a) -> SBV (Concrete 'BoolTy)) -> Motive a
   MEq       :: Expr ('List a)                               -> Motive a
-  MAt       :: SBV (Concrete 'IntTy) -> SBV (Concrete a)    -> Motive a
-  MContains ::                          SBV (Concrete a)    -> Motive a
+  MAt       :: Expr 'IntTy -> Expr a                        -> Motive a
+  MContains ::                                    Expr a    -> Motive a
   -- MFold
 
 evalMotive'
   :: forall a. (Show (Concrete a), SymWord (Concrete a))
-  => Motive a -> Expr ('List a) -> Symbolic ()
-evalMotive' (Length len) = \case
+  => (SBV Bool -> Symbolic ()) -> Motive a -> Expr ('List a) -> Symbolic ()
+evalMotive' constrain' (Length len) = \case
   ListCat a b -> do
     [al, bl] <- sIntegers ["al", "bl"]
-    constrain $ al + bl .== len
-    evalMotive' (Length al) a
-    evalMotive' (Length bl) b
-  ListMap _ _ lst -> evalMotive' (Length len) lst
+    constrain $ al + bl .== sEval len
+    evalMotive' constrain' (Length (Sym al)) a
+    evalMotive' constrain' (Length (Sym bl)) b
+  ListMap _ lst -> evalMotive' constrain' (Length len) lst
   ListAt{} -> error "nested lists not allowed"
   ListInfo i -> case i of
-    LenInfo (SListLength len') -> constrain $ len' .== len
+    LenInfo (SListLength len') -> constrain $ len' .== sEval len
     _                          -> error $ "sorry, can't help with this motive: " ++ show i
-evalMotive' (MAnd f) = \case
+evalMotive' constrain' (MAnd f) = \case
   ListCat a b -> do
-    evalMotive' (MAnd f) a
-    evalMotive' (MAnd f) b
-  ListMap _ g lst -> evalMotive' (MAnd (f . g)) lst
+    evalMotive' constrain' (MAnd f) a
+    evalMotive' constrain' (MAnd f) b
+  ListMap g lst -> evalMotive' constrain' (MAnd (f . g)) lst
   ListAt{} -> error "nested lists not allowed"
   ListInfo i -> case i of
-    OrInfo (SOr b) -> constrain $ error "TODO"
+    AndInfo (SAnd b) -> constrain $ sEval $ f $ Sym b
     -- constrain $ foldr (&&&) true (f . literal <$> lst)
     -- traverse (constrain . f . literal) lst >> pure ()
+    CmpInfo (SCmp g) -> do
+      i <- forall "i"
+      constrain $ sEval $ f $ Sym i
+      constrain $ g i
+    LenInfo (SListLength len)
+      | Just 0 <- unliteral len -> pure ()
+      | otherwise -> error "TODO"
     _ -> error $ "sorry, can't help with this motive: " ++ show i
-evalMotive' (MOr f) = \case
+evalMotive' constrain' (MOr f) = \case
   ListCat a b -> do
-    evalMotive' (MOr f) a
-    evalMotive' (MOr f) b
-  ListMap _ g lst -> evalMotive' (MOr (f . g)) lst
+    -- XXX need to add an OR here
+    evalMotive' constrain' (MOr f) a
+    evalMotive' constrain' (MOr f) b
+  ListMap g lst -> evalMotive' constrain' (MOr (f . g)) lst
   ListAt{} -> error "nested lists not allowed"
-  ListInfo lst  -> error "TODO"
+  ListInfo info -> case info of
+    LenInfo (SListLength len)
+      | Just 0 <- unliteral len -> constrain false
+      | otherwise -> error "TODO"
+    info -> error $ "sorry, can't help with this motive: " ++ show info
     -- constrain $ foldr (|||) false (f . literal <$> lst)
-evalMotive' (MEq lst) = \case
+evalMotive' constrain' (MEq lst) = \case
   ListCat a b -> constrain $ sEval a .++ sEval b .== sEval lst
   ListMap{} -> error "XXX tricky"
   ListAt{} -> error "nested lists not allowed"
@@ -284,55 +309,61 @@ evalMotive' (MEq lst) = \case
     -- do
     -- ifor_ litLst $ \i val -> constrain $
     --   sEval lst .!! fromIntegral i .== literal val
-evalMotive' (MAt i a) = \case
+evalMotive' constrain' (MAt i a) = \case
   ListCat l1 l2 -> do
     let l1' = sEval l1
         l2' = sEval l2
+        i'  = sEval i
+        a'  = sEval a
     constrain $
-      l1' .!! i                     .== a |||
-      l2' .!! (i - SBVL.length l1') .== a
+      l1' .!! i'                     .== a' |||
+      l2' .!! (i' - SBVL.length l1') .== a'
   ListMap{} -> error "XXX tricky 3"
   ListAt{} -> error "nested lists not allowed"
   ListInfo litLst -> error "TODO"
   -- ifor_ litLst $ \j val -> constrain $
   --   fromIntegral j .== i ==> literal val .== a
-evalMotive' motive@(MContains a) = \case
+evalMotive' constrain' motive@(MContains a) = \case
   ListCat l1 l2 -> do
-    evalMotive' motive l1
-    evalMotive' motive l2
+    -- XXX need to add an OR here somehow
+    evalMotive' constrain' motive l1
+    evalMotive' constrain' motive l2
   ListMap{} -> error "XXX tricky 4"
   ListAt{} -> error "nested lists not allowed"
   ListInfo litLst -> error "TODO"
   -- for_ litLst $ \val -> constrain $
   --   literal val .== a
 
-evalMotive :: Suitable ty => SBV (Concrete ty) -> Expr ty -> Symbolic ()
-evalMotive motive = \case
-  ListLen lst        -> evalMotive' (Length motive) lst
-  ListAnd lst        -> evalMotive' (MAnd (.== motive)) lst
-  ListOr  lst        -> evalMotive' (MOr  (.== motive)) lst
-  ListEq a b         -> evalMotive' (MEq a) b -- XXX use motive
-  ListAt lst i       -> evalMotive' (MAt (sEval i) motive) lst
-  ListContains lst a -> evalMotive' (MContains (sEval a)) lst
+evalMotive :: Suitable ty => (SBV Bool -> Symbolic ()) -> Expr ty -> Expr ty -> Symbolic ()
+evalMotive constrain' motive expr = case expr of
+  ListLen lst        -> evalMotive' constrain' (Length motive) lst
+  ListAnd lst        -> evalMotive' constrain' (MAnd (Eq motive)) lst
+  ListOr  lst        -> evalMotive' constrain' (MOr  (Eq motive)) lst
+  ListEq a b         -> evalMotive' constrain' (MEq a) b -- XXX use motive
+  ListAt lst i       -> evalMotive' constrain' (MAt i motive) lst
+  ListContains lst a -> evalMotive' constrain' (MContains a) lst
 
   -- XXX map not
-  Not (ListAnd lst)  -> evalMotive motive (ListOr  (ListMap not bnot lst))
-  Not (ListOr  lst)  -> evalMotive motive (ListAnd (ListMap not bnot lst))
+  Not (ListAnd lst)  -> evalMotive (constrain' . bnot) motive expr
+  Not (ListOr  lst)  -> evalMotive (constrain' . bnot) motive expr
   other -> error $ show other
 
 main :: IO ()
 main = do
 
-  print <=< prove $
+  -- print <=< prove $
+  makeReport "(len 2) + (len 4) == len 6 (expect good)" $ do
     let len = unSListLength $ unFoldedList $
           FoldedList (SListLength 2) `concat` FoldedList (SListLength 4)
-    in len .== 6
+    constrain $ len .== 6
 
-  print <=< prove $
-    let len = unSListLength $ unFoldedList $
-          concat (FoldedList (SListLength 2)) (FoldedList (SListLength 4))
-    in len .== 6
+  makeReport "true (expect good)"  $
+    constrain true
 
+  makeReport "false (expect bad)" $
+    constrain false
+
+  {-
   print <=< prove $ unSAll $ unFoldedList $
     implode $ SOr . (.> 0) <$> [ 1, 2, 3 :: SBV Integer ]
 
@@ -343,6 +374,7 @@ main = do
     a <- sInteger "a"
     pure $ unSAll $ unFoldedList $
       implode $ SOr . (.> 0) <$> [ a, 2, 3 :: SBV Integer ]
+  -}
 
   -- TODO
   -- print <=< prove $ do
@@ -352,16 +384,16 @@ main = do
 
   makeReport "length [] == 0 (expect good)" $ do
     let lst = ListInfo (LenInfo (SListLength 0)) :: Expr ('List 'IntTy)
-    evalMotive 0 (ListLen lst)
+    evalMotive constrain (LitI 0) (ListLen lst)
 
   -- proveWith z3 {verbose=True}
 
   -- show that the result of a mapping is all positive
   makeReport "fmap (> 0) lst == true (expect good)" $ do
-    let expr  = ListInfo (CmpInfo (SCmp GT 0)) :: Expr ('List 'IntTy)
-        expr' = ListAnd (ListMap (> 0) (.> 0) expr)
+    let expr  = ListInfo (CmpInfo (SCmp (.> 0))) :: Expr ('List 'IntTy)
+        expr' = ListAnd (ListMap (Gt (LitI 0)) expr)
 
-    evalMotive true expr'
+    evalMotive constrain true' expr'
 
 --   -- should falsify the assertion
 --   makeReport "fmap (> 0) lst == true (false)" $ do
@@ -376,47 +408,45 @@ main = do
 --         (lst .!! i .>  0)
 
 --     let expr  = Sym lst :: Expr ('List 'IntTy)
---         expr' = ListAnd (ListMap (> 0) (.> 0) expr)
+--         expr' = ListAnd (ListMap (Gt (LitI 0)) expr)
 
---     evalMotive true expr'
+--     evalMotive constrain true expr'
 
   makeReport "(and []) == true (expect good)" $
-    evalMotive true $       ListAnd $ ListInfo $ LenInfo $ SListLength 0
+    evalMotive constrain true' $       ListAnd $ ListInfo $ LenInfo $ SListLength 0
 
   makeReport "(not (and [])) == true (expect bad)" $
-    evalMotive true $ Not $ ListAnd $ ListInfo $ LenInfo $ SListLength 0
+    evalMotive constrain true' $ Not $ ListAnd $ ListInfo $ LenInfo $ SListLength 0
 
   makeReport "(and [true]) == true (expect good)" $
-    evalMotive true $       ListAnd $ ListInfo $ OrInfo $ SOr true
+    evalMotive constrain true' $       ListAnd $ ListInfo $ AndInfo $ SAnd true
       -- Lit [true]
 
   makeReport "(and [false]) == true (expect bad)" $
-    evalMotive true $       ListAnd $ ListInfo $ OrInfo $ SOr false
+    evalMotive constrain true' $       ListAnd $ ListInfo $ AndInfo $ SAnd false
       -- Lit [false]
 
   makeReport "(not (and [false])) == true (expect good)" $
-    evalMotive true $ Not $ ListAnd $ ListInfo $ OrInfo $ SOr false
+    evalMotive constrain true' $ Not $ ListAnd $ ListInfo $ AndInfo $ SAnd false
       -- Lit [false]
 
-  makeReport "true (expect good)"  $
-    constrain true
-
-  makeReport "false (expect bad)" $
-    constrain false
+true', false' :: Expr 'BoolTy
+true'  = LitB true
+false' = LitB false
 
 makeReport :: String -> Symbolic () -> IO ()
 makeReport header a = do
   putStrLn $ '\n' : header
-  -- provable <- prove a
+  ThmResult provable <- prove a
   -- putStrLn $ "provable:    " ++ show provable
-  SatResult satisfiable <- sat a
+  -- SatResult satisfiable <- sat a
   -- putStrLn $ "satisfiable: " ++ show satisfiable
   vacuous <- isVacuous a
   -- putStrLn $ "vacuous:     " ++ show vacuous
   putStrLn $
     if vacuous
-    then "vacuous"
-    else case satisfiable of
-           Satisfiable{}   -> "good"
-           Unsatisfiable{} -> "bad"
-           _               -> show $ SatResult satisfiable
+    then "bad (vacuous)"
+    else case provable of
+           Satisfiable{}   -> "bad (not vacuous)"
+           Unsatisfiable{} -> "good"
+           _               -> show $ ThmResult provable
