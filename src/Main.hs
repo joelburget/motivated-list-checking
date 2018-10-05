@@ -139,63 +139,63 @@ data ListInfo a where
 
 instance Show (ListInfo a) where
   showsPrec p li = showParen (p > 10) $ case li of
-    LitList l -> showString "LitList " . showsPrec 10 l
-    LenInfo i -> showString "LenInfo " . showsPrec 10 i
-    OrInfo  i -> showString "OrInfo "  . showsPrec 10 i
-    AndInfo i -> showString "AndInfo " . showsPrec 10 i
-    CmpInfo i -> showString "CmpInfo " . showsPrec 10 i
+    LitList l -> showString "LitList " . showsPrec 11 l
+    LenInfo i -> showString "LenInfo " . showsPrec 11 i
+    OrInfo  i -> showString "OrInfo "  . showsPrec 11 i
+    AndInfo i -> showString "AndInfo " . showsPrec 11 i
+    CmpInfo i -> showString "CmpInfo " . showsPrec 11 i
 
 instance Show (Expr ty) where
   showsPrec p expr = showParen (p > 10) $ case expr of
-    ListLen l          -> showString "ListLen " . showsPrec 10 l
-    ListAnd l          -> showString "ListAnd " . showsPrec 10 l
-    ListOr  l          -> showString "ListOr " . showsPrec 10 l
-    ListEq  a b        -> showString "ListEq " . showsPrec 10 a . showsPrec 10 b
+    ListLen l          -> showString "ListLen " . showsPrec 11 l
+    ListAnd l          -> showString "ListAnd " . showsPrec 11 l
+    ListOr  l          -> showString "ListOr " . showsPrec 11 l
+    ListEq  a b        -> showString "ListEq " . showsPrec 11 a . showsPrec 11 b
     ListAt lst i       ->
       showString "ListAt " .
-      showsPrec 10 lst .
+      showsPrec 11 lst .
       showString " " .
-      showsPrec 10 i
+      showsPrec 11 i
     ListContains lst a ->
       showString "ListContains " .
-      showsPrec 10 lst .
+      showsPrec 11 lst .
       showString " " .
-      showsPrec 10 a
+      showsPrec 11 a
 
     ListCat a b        ->
       showString "ListCat " .
-      showsPrec 10 a .
+      showsPrec 11 a .
       showString " " .
-      showsPrec 10 b
+      showsPrec 11 b
     ListMap _ as     ->
       showString "ListMap _ " .
-      showsPrec 10 as
-    ListInfo i         -> showString "ListInfo " . showsPrec 10 i
+      showsPrec 11 as
+    ListInfo i         -> showString "ListInfo " . showsPrec 11 i
 
-    LitB a             -> showString "LitB" . showsPrec 10 a
-    LitI a             -> showString "LitI" . showsPrec 10 a
+    LitB a             -> showString "LitB " . showsPrec 11 a
+    LitI a             -> showString "LitI " . showsPrec 11 a
     Eq a b             ->
       showString "Eq " .
-      showsPrec 10 a .
+      showsPrec 11 a .
       showString " " .
-      showsPrec 10 b
+      showsPrec 11 b
     Gt a b             ->
-      showString "Gt" .
-      showsPrec 10 a .
+      showString "Gt " .
+      showsPrec 11 a .
       showString " " .
-      showsPrec 10 b
+      showsPrec 11 b
     And a b            ->
-      showString "And" .
-      showsPrec 10 a .
+      showString "And " .
+      showsPrec 11 a .
       showString " " .
-      showsPrec 10 b
+      showsPrec 11 b
     Or a b             ->
-      showString "Or" .
-      showsPrec 10 a .
+      showString "Or " .
+      showsPrec 11 a .
       showString " " .
-      showsPrec 10 b
-    Not a              -> showString "Not" . showsPrec 10 a
-    Sym a -> showsPrec 10 a
+      showsPrec 11 b
+    Not a              -> showString "Not" . showsPrec 11 a
+    Sym a -> showsPrec 11 a
 
 eval :: Expr ty -> Concrete ty
 eval = \case
