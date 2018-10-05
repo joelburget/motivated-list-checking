@@ -94,7 +94,7 @@ type instance Concrete ('List a) = [Concrete a]
 type instance Concrete 'IntTy    = Integer
 type instance Concrete 'BoolTy   = Bool
 
-type Suitable a = (Show (Concrete a), SymWord (Concrete a))
+type Suitable a = (Show (Concrete a), SymWord (Concrete a), Literal a)
 
 data Expr ty where
   -- list consumers
@@ -105,10 +105,10 @@ data Expr ty where
 
   ListAll  :: Suitable a
            => (Expr a -> Expr 'BoolTy)
-           -> Expr ('List 'BoolTy)             -> Expr 'BoolTy
+           -> Expr ('List a)                   -> Expr 'BoolTy
   ListAny  :: Suitable a
            => (Expr a -> Expr 'BoolTy)
-           -> Expr ('List 'BoolTy)             -> Expr 'BoolTy
+           -> Expr ('List a)                   -> Expr 'BoolTy
 
   ListEq   :: Suitable a
            => Expr ('List a) -> Expr ('List a) -> Expr 'BoolTy
@@ -159,6 +159,14 @@ instance Show (Expr ty) where
   showsPrec p expr = showParen (p > 10) $ case expr of
     ListLen l          -> showString "ListLen " . showsPrec 11 l
     ListAnd l          -> showString "ListAnd " . showsPrec 11 l
+    ListAll f l        ->
+      showString "ListAll " .
+      showsPrec 11 (f (Sym (uninterpret "x"))) .
+      showsPrec 11 l
+    ListAny f l        ->
+      showString "ListAny " .
+      showsPrec 11 (f (Sym (uninterpret "x"))) .
+      showsPrec 11 l
     ListOr  l          -> showString "ListOr " . showsPrec 11 l
     ListEq  a b        -> showString "ListEq " . showsPrec 11 a . showsPrec 11 b
     ListAt lst i       ->
@@ -207,11 +215,22 @@ instance Show (Expr ty) where
     Not a              -> showString "Not" . showsPrec 11 a
     Sym a -> showsPrec 11 a
 
+class Literal a where
+  lit :: Concrete a -> Expr a
+
+instance Literal 'BoolTy where
+  lit = LitB
+
+instance Literal 'IntTy where
+  lit = LitI
+
 eval :: Expr ty -> Concrete ty
 eval = \case
   ListLen l          -> fromIntegral $ length $ eval l
   ListAnd l          -> and $ eval l
-  ListOr  l          -> or $ eval l
+  ListOr  l          -> or  $ eval l
+  ListAll f l        -> and $ fmap (eval . f . lit) $ eval l
+  ListAny f l        -> or  $ fmap (eval . f . lit) $ eval l
   ListEq  a b        -> eval a == eval b
   ListAt lst i       -> eval lst !! fromIntegral (eval i)
   ListContains lst a -> eval a `elem` eval lst
