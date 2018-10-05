@@ -128,15 +128,16 @@ data Expr ty where
   ListInfo :: ListInfo a                       -> Expr ('List a)
 
   -- other
-  LitB     :: Concrete 'BoolTy                 -> Expr 'BoolTy
-  LitI     :: Concrete 'IntTy                  -> Expr 'IntTy
   Eq       :: (Eq (Concrete a), Suitable a)
            => Expr a         -> Expr a         -> Expr 'BoolTy
   Gt       :: Expr 'IntTy    -> Expr 'IntTy    -> Expr 'BoolTy
   And      :: Expr 'BoolTy   -> Expr 'BoolTy   -> Expr 'BoolTy
   Or       :: Expr 'BoolTy   -> Expr 'BoolTy   -> Expr 'BoolTy
   Not      ::                   Expr 'BoolTy   -> Expr 'BoolTy
-  Sym :: SBV (Concrete a) -> Expr a
+
+  LitB     :: Concrete 'BoolTy                 -> Expr 'BoolTy
+  LitI     :: Concrete 'IntTy                  -> Expr 'IntTy
+  Sym      :: SBV (Concrete a)                 -> Expr a
 
 data ListInfo a where
   LitList :: [SBV (Concrete a)] -> ListInfo a
@@ -236,8 +237,7 @@ eval = \case
   ListContains lst a -> eval a `elem` eval lst
 
   ListCat a b        -> eval a <> eval b
-  -- Pending lit / injection
-  -- ListMap f as       -> eval . f . lit <$> eval as
+  ListMap f as       -> eval . f . lit <$> eval as
   ListInfo _         -> error "cannot evaluate list info"
 
   Eq a b             -> eval a == eval b
@@ -245,14 +245,18 @@ eval = \case
   And a b            -> eval a && eval b
   Or a b             -> eval a || eval b
   Not a              -> not (eval a)
+
   LitB a             -> a
   LitI a             -> a
+  Sym _              -> error "canot evaluate symbolic value"
 
 sEval :: SymWord (Concrete ty) => Expr ty -> SBV (Concrete ty)
 sEval = \case
   ListLen l      -> SBVL.length $ sEval l
   ListAnd _      -> error "can't fold with sbv lists"
   ListOr  _      -> error "can't fold with sbv lists"
+  ListAll{}      -> error "can't fold with sbv lists"
+  ListAny{}      -> error "can't fold with sbv lists"
   ListEq  a b    -> sEval a .== sEval b
   ListAt lst i   -> sEval lst .!! sEval i
   ListContains{} -> error "can't contains with sbv lists"
@@ -299,6 +303,7 @@ evalMotive (Length len) = \case
   ListInfo i -> case i of
     LenInfo (SListLength len') -> pure $ len' .== sEval len
     _                          -> error $ "sorry, can't help with this motive: " ++ show i
+  Sym{} -> error "can't motivate evaluation of symbolic value"
 evalMotive (MAll f) = \case
   ListCat a b -> (&&&)
     <$> evalMotive (MAll f) a
@@ -312,15 +317,16 @@ evalMotive (MAll f) = \case
       -- example:
       -- f: for all i: elements of the list, i > 0
       -- g: i need to know that for all i: elements of the list, i > -1
-      i <- forall_
-      traceShowM $ f $ Sym i
-      let fEval = sEval $ f $ Sym i
-          gEval =         g       i
+      j <- forall_
+      traceShowM $ f $ Sym j
+      let fEval = sEval $ f $ Sym j
+          gEval =         g       j
       pure $ gEval ==> fEval
     LenInfo (SListLength len)
       | Just 0 <- unliteral len -> pure true
       | otherwise -> error "TODO"
     _ -> error $ "sorry, can't help with this motive: " ++ show i
+  Sym{} -> error "can't motivate evaluation of symbolic value"
 evalMotive (MAny f) = \case
   ListCat a b -> (|||)
     <$> evalMotive (MAny f) a
@@ -331,7 +337,8 @@ evalMotive (MAny f) = \case
     LenInfo (SListLength len)
       | Just 0 <- unliteral len -> pure false
       | otherwise -> error "TODO"
-    info -> error $ "sorry, can't help with this motive: " ++ show info
+    _ -> error $ "sorry, can't help with this motive: " ++ show info
+  Sym{} -> error "can't motivate evaluation of symbolic value"
 evalMotive (MEq lst) = \case
   ListCat a b -> pure $ sEval a .++ sEval b .== sEval lst
   ListMap{} -> error "XXX tricky"
@@ -340,6 +347,7 @@ evalMotive (MEq lst) = \case
     -- do
     -- ifor_ litLst $ \i val -> constrain $
     --   sEval lst .!! fromIntegral i .== literal val
+  Sym{} -> error "can't motivate evaluation of symbolic value"
 evalMotive (MAt i a) = \case
   ListCat l1 l2 -> do
     let l1' = sEval l1
@@ -354,6 +362,7 @@ evalMotive (MAt i a) = \case
   ListInfo litLst -> error "TODO"
   -- ifor_ litLst $ \j val -> constrain $
   --   fromIntegral j .== i ==> literal val .== a
+  Sym{} -> error "can't motivate evaluation of symbolic value"
 evalMotive motive@(MContains a) = \case
   ListCat l1 l2 -> (|||)
     <$> evalMotive motive l1
@@ -363,6 +372,7 @@ evalMotive motive@(MContains a) = \case
   ListInfo litLst -> error "TODO"
   -- for_ litLst $ \val -> constrain $
   --   literal val .== a
+  Sym{} -> error "can't motivate evaluation of symbolic value"
 
 main :: IO ()
 main = do
