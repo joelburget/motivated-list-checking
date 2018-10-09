@@ -37,8 +37,11 @@ instance Monoid SListLength where
   mempty = SListLength 0
 
 -- Just use SOr if you need a boolean predicate
-data SAny = SAny (SBV Integer) Ordering
-  deriving Show
+data SAny a = SAny (Expr a -> Expr 'BoolTy)
+
+instance HasKind (Concrete a) => Show (SAny a) where
+  showsPrec p (SAny f) = showParen (p > 10) $
+    showString "SAny " . showsPrec 11 (f (Sym (uninterpret "a")))
 
 -- Just use SAnd if you need a boolean predicate
 data SAll = SAll (SBV Integer) Ordering
