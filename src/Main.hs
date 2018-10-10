@@ -12,6 +12,7 @@
 {-# LANGUAGE TypeFamilies         #-}
 {-# LANGUAGE TypeOperators        #-}
 {-# LANGUAGE TypeSynonymInstances #-}
+{-# LANGUAGE UndecidableInstances #-}
 module Main where
 
 import           Control.Monad ((<=<))
@@ -19,8 +20,6 @@ import           Data.SBV
 import           Data.SBV.List ((.!!), (.++))
 import qualified Data.SBV.List as SBVL
 import           Prelude       as P hiding (concat)
-
-import           Debug.Trace
 
 
 -- A list represented as the result of a fold
@@ -40,14 +39,15 @@ instance Monoid SListLength where
 data SAny a = SAny (Expr a -> Expr 'BoolTy)
 
 instance HasKind (Concrete a) => Show (SAny a) where
-  showsPrec p (SAny f) = showParen (p > 10) $
-    showString "SAny " . showsPrec 11 (f (Sym (uninterpret "a")))
+  show (SAny f) = show (f (Sym (uninterpret "x")))
 
 -- Just use SAnd if you need a boolean predicate
-data SAll = SAll (SBV Integer) Ordering
-  deriving Show
+data SAll a = SAll (Expr a -> Expr 'BoolTy)
 
-newtype SOr = SOr { unSAll :: SBV Bool }
+instance HasKind (Concrete a) => Show (SAll a) where
+  show (SAll f) = show (f (Sym (uninterpret "x")))
+
+newtype SOr = SOr { unSOr :: SBV Bool }
   deriving Show
 
 instance Semigroup SOr where
@@ -145,8 +145,8 @@ data Expr ty where
 data ListInfo a where
   LitList :: [SBV (Concrete a)] -> ListInfo a
   LenInfo :: SListLength        -> ListInfo a
-  -- AnyInfo :: SAny               -> ListInfo 'IntTy
-  -- AllInfo :: SAll               -> ListInfo 'IntTy
+  AnyInfo :: SAny 'IntTy        -> ListInfo 'IntTy
+  AllInfo :: SAll 'IntTy        -> ListInfo 'IntTy
   OrInfo  :: SOr                -> ListInfo 'BoolTy
   AndInfo :: SAnd               -> ListInfo 'BoolTy
   CmpInfo :: SCmp               -> ListInfo 'IntTy
@@ -155,6 +155,8 @@ instance Show (ListInfo a) where
   showsPrec p li = showParen (p > 10) $ case li of
     LitList l -> showString "LitList " . showsPrec 11 l
     LenInfo i -> showString "LenInfo " . showsPrec 11 i
+    AnyInfo i -> showString "AnyInfo " . showsPrec 11 i
+    AllInfo i -> showString "AllInfo " . showsPrec 11 i
     OrInfo  i -> showString "OrInfo "  . showsPrec 11 i
     AndInfo i -> showString "AndInfo " . showsPrec 11 i
     CmpInfo i -> showString "CmpInfo " . showsPrec 11 i
@@ -315,13 +317,17 @@ evalMotive (MAll f) = \case
   ListAt{} -> error "nested lists not allowed"
   ListInfo i -> case i of
     AndInfo (SAnd b) -> pure $ sEval $ f $ Sym b
+    AllInfo (SAll g) -> do
+      j <- forall_
+      let fEval = sEval $ f $ Sym j
+          gEval = sEval $ g $ Sym j
+      pure $ gEval ==> fEval
     CmpInfo (SCmp g) -> do
       -- g is at least as strong an assumption as f.
       -- example:
       -- f: for all i: elements of the list, i > 0
       -- g: i need to know that for all i: elements of the list, i > -1
       j <- forall_
-      traceShowM $ f $ Sym j
       let fEval = sEval $ f $ Sym j
           gEval =         g       j
       pure $ gEval ==> fEval
@@ -337,6 +343,12 @@ evalMotive (MAny f) = \case
   ListMap g lst -> evalMotive (MAny (f . g)) lst
   ListAt{} -> error "nested lists not allowed"
   ListInfo info -> case info of
+    OrInfo  (SOr b) -> pure $ sEval $ f $ Sym b -- TODO: right?
+    AnyInfo (SAny g) -> do
+      j <- exists_
+      let fEval = sEval $ f $ Sym j
+          gEval = sEval $ g $ Sym j
+      pure $ gEval ==> fEval
     LenInfo (SListLength len)
       | Just 0 <- unliteral len -> pure false
       | otherwise -> error "TODO"
@@ -415,30 +427,20 @@ main = do
     let lst = ListInfo (LenInfo (SListLength 0)) :: Expr ('List 'IntTy)
     constrain =<< evalMotive (Length (LitI 0)) lst
 
-  -- proveWith z3 {verbose=True}
-
   -- show that the result of a mapping is all positive
   makeReport "fmap (> 0) lst == true (expect good)" $ do
-    let expr = ListInfo (CmpInfo (SCmp (.> 0))) :: Expr ('List 'IntTy)
+    let lst = ListInfo (CmpInfo (SCmp (.> 0))) :: Expr ('List 'IntTy)
 
-    constrain =<< evalMotive (MAll (Gt (LitI 0))) expr
+    constrain =<< evalMotive (MAll (\x -> (Gt x (LitI 0)))) lst
 
---   -- should falsify the assertion
---   makeReport "fmap (> 0) lst == true (false)" $ do
---     lst <- sList "lst"
-
---     i <- forall "i"
---     constrain $
---       i .>= 0
---       ==>
---       ite (i .== 10)
---         (lst .!! i .== 0)
---         (lst .!! i .>  0)
-
---     let expr  = Sym lst :: Expr ('List 'IntTy)
---         expr' = ListAnd (ListMap (Gt (LitI 0)) expr)
-
---     constrain =<< evalMotive true expr'
+  let almostAllPos :: Expr ('List 'IntTy)
+      almostAllPos = ListCat
+        (ListInfo (CmpInfo (SCmp (.> 0))))
+        (ListCat
+          (ListInfo (CmpInfo (SCmp (.== 0))))
+          (ListInfo (CmpInfo (SCmp (.> 0)))))
+  makeReport "fmap (> 0) almostAllPos == true (expect bad)" $ do
+    constrain =<< evalMotive (MAll (\x -> (Gt x (LitI 0)))) almostAllPos
 
   makeReport "(and []) == true (expect good)" $
     constrain <=< evalMotive (MAll (Eq true')) $ ListInfo $ LenInfo $ SListLength 0
@@ -459,6 +461,10 @@ main = do
     x <- evalMotive (MAll (Eq true')) $ ListInfo $ AndInfo $ SAnd false
     constrain $ bnot x
       -- Lit [false]
+
+  makeReport "fmap (> 0) (all [> 0]) == true (expect good)" $ do
+    constrain <=< evalMotive (MAll (\x -> Gt x (LitI 0))) $ ListInfo $ AllInfo $
+      SAll (\x -> Gt x (LitI 0))
 
 true', false' :: Expr 'BoolTy
 true'  = LitB true
