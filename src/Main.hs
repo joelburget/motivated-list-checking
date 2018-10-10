@@ -297,24 +297,21 @@ evalMotive (MAt i a) (ListInfo info) = case info of
        (SBVL.implode litList SBVL..!! iV) .== aV
 
   _ -> error "can't help with this motive"
-  -- ifor_ litLst $ \j val -> constrain $
-  --   fromIntegral j .== i ==> literal val .== a
 
 evalMotive (MNegate (MAll f)) lst = evalMotive (MAny (Not . f)) lst
 evalMotive (MNegate (MAny f)) lst = evalMotive (MAll (Not . f)) lst
 
+l0 :: Expr 'IntTy
+l0 = LitI 0
+
+gt0 :: Expr 'IntTy -> Expr 'BoolTy
+gt0 x = Gt x l0
+
+lte0 :: Expr 'IntTy -> Expr 'BoolTy
+lte0 x = Not (Gt x l0)
+
 main :: IO ()
 main = do
-
-  let l0 :: Expr 'IntTy
-      l0 = LitI 0
-
-      gt0 :: Expr 'IntTy -> Expr 'BoolTy
-      gt0 x = Gt x l0
-
-      lte0 :: Expr 'IntTy -> Expr 'BoolTy
-      lte0 x = Not (Gt x l0)
-
   makeReport "any (> 0) [1, 2, 3] (expect good)" $ do
     let lst = ListInfo (LitList [1, 2, 3])
     constrain =<< evalMotive (MAny gt0) lst
@@ -345,7 +342,6 @@ main = do
   -- show that the result of a mapping is all positive
   makeReport "fmap (> 0) lst == true (expect good)" $ do
     let lst = ListInfo (AllInfo gt0) :: Expr ('List 'IntTy)
-
     constrain =<< evalMotive (MAll gt0) lst
 
   let almostAllPos :: Expr ('List 'IntTy)
