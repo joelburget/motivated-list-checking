@@ -35,7 +35,6 @@ instance Semigroup SListLength where
 instance Monoid SListLength where
   mempty = SListLength 0
 
--- Just use SOr if you need a boolean predicate
 data SAny a = SAny (Expr a -> Expr 'BoolTy)
 
 instance HasKind (Concrete a) => Show (SAny a) where
@@ -46,24 +45,6 @@ data SAll a = SAll (Expr a -> Expr 'BoolTy)
 
 instance HasKind (Concrete a) => Show (SAll a) where
   show (SAll f) = show (f (Sym (uninterpret "x")))
-
-newtype SOr = SOr { unSOr :: SBV Bool }
-  deriving Show
-
-instance Semigroup SOr where
-  SOr x <> SOr y = SOr (x &&& y)
-
-instance Monoid SOr where
-  mempty = SOr true
-
-newtype SAnd = SAnd { unSAnd :: SBV Bool }
-  deriving Show
-
-instance Semigroup SAnd where
-  SAnd x <> SAnd y = SAnd (x ||| y)
-
-instance Monoid SAnd where
-  mempty = SAnd false
 
 -- TODO: contains monoid
 
@@ -123,7 +104,8 @@ data Expr ty where
            ->                   Expr ('List a) -> Expr ('List b)
 
   -- producers
-  ListInfo :: ListInfo a                       -> Expr ('List a)
+  -- TODO: use Suitable?
+  ListInfo :: HasKind (Concrete a) => ListInfo a -> Expr ('List a)
 
   -- other
   Eq       :: (Eq (Concrete a), Suitable a)
@@ -141,18 +123,14 @@ data ListInfo a where
   LitList :: [SBV (Concrete a)] -> ListInfo a
   LenInfo :: SListLength        -> ListInfo a
   AnyInfo :: SAny 'IntTy        -> ListInfo 'IntTy
-  AllInfo :: SAll 'IntTy        -> ListInfo 'IntTy
-  OrInfo  :: SOr                -> ListInfo 'BoolTy
-  AndInfo :: SAnd               -> ListInfo 'BoolTy
+  AllInfo :: SAll a             -> ListInfo a
 
-instance Show (ListInfo a) where
+instance HasKind (Concrete a) => Show (ListInfo a) where
   showsPrec p li = showParen (p > 10) $ case li of
     LitList l -> showString "LitList " . showsPrec 11 l
     LenInfo i -> showString "LenInfo " . showsPrec 11 i
     AnyInfo i -> showString "AnyInfo " . showsPrec 11 i
     AllInfo i -> showString "AllInfo " . showsPrec 11 i
-    OrInfo  i -> showString "OrInfo "  . showsPrec 11 i
-    AndInfo i -> showString "AndInfo " . showsPrec 11 i
 
 instance Show (Expr ty) where
   showsPrec p expr = showParen (p > 10) $ case expr of
@@ -278,81 +256,70 @@ sEval = \case
 
 -- The motive for consuming a list of type @a@
 data Motive a where
-  Length    :: Expr 'IntTy              -> Motive a
+  MLength   :: Expr 'IntTy              -> Motive a
+  MAt       :: Expr 'IntTy -> Expr a    -> Motive a
+  MNegate   :: Motive a                 -> Motive a
+
   MAll      :: (Expr a -> Expr 'BoolTy) -> Motive a
   MAny      :: (Expr a -> Expr 'BoolTy) -> Motive a
-  MEq       :: Expr ('List a)           -> Motive a
-  MAt       :: Expr 'IntTy -> Expr a    -> Motive a
-  MContains :: Expr a                   -> Motive a
   -- MFold
 
 evalMotive
   :: forall a. (Show (Concrete a), SymWord (Concrete a))
   => Motive a -> Expr ('List a) -> Symbolic (SBV Bool)
-evalMotive (Length len) = \case
-  ListCat a b -> do
-    [al, bl] <- sIntegers ["al", "bl"]
-    let totalLen = al + bl .== sEval len
-    aLen <- evalMotive (Length (Sym al)) a
-    bLen <- evalMotive (Length (Sym bl)) b
-    pure $ totalLen &&& aLen &&& bLen
-  ListMap _ lst -> evalMotive (Length len) lst
-  ListAt{} -> error "nested lists not allowed"
-  ListInfo i -> case i of
-    LenInfo (SListLength len') -> pure $ len' .== sEval len
-    _                          -> error $ "sorry, can't help with this motive: " ++ show i
-  Sym{} -> error "can't motivate evaluation of symbolic value"
-evalMotive (MAll f) = \case
-  ListCat a b -> (&&&)
-    <$> evalMotive (MAll f) a
-    <*> evalMotive (MAll f) b
-  ListMap g lst -> evalMotive (MAll (f . g)) lst
-  ListAt{} -> error "nested lists not allowed"
-  ListInfo i -> case i of
-    AndInfo (SAnd b) -> pure $ sEval $ f $ Sym b
-    AllInfo (SAll g) -> do
-      j <- forall_
-      -- g is at least as strong an assumption as f.
-      -- example:
-      -- f: for all i: elements of the list, i > 0
-      -- g: i need to know that for all i: elements of the list, i > -1
-      let fEval = sEval $ f $ Sym j
-          gEval = sEval $ g $ Sym j
-      pure $ gEval ==> fEval
-    LenInfo (SListLength len)
-      | Just 0 <- unliteral len -> pure true
-      | otherwise -> error "TODO"
-    _ -> error $ "sorry, can't help with this motive: " ++ show i
-  Sym{} -> error "can't motivate evaluation of symbolic value"
-evalMotive (MAny f) = \case
-  ListCat a b -> (|||)
-    <$> evalMotive (MAny f) a
-    <*> evalMotive (MAny f) b
-  ListMap g lst -> evalMotive (MAny (f . g)) lst
-  ListAt{} -> error "nested lists not allowed"
-  ListInfo info -> case info of
-    OrInfo  (SOr b) -> pure $ sEval $ f $ Sym b -- TODO: right?
-    AnyInfo (SAny g) -> do
-      j <- exists_
-      let fEval = sEval $ f $ Sym j
-          gEval = sEval $ g $ Sym j
-      pure $ gEval ==> fEval
-    LenInfo (SListLength len)
-      | Just 0 <- unliteral len -> pure false
-      | otherwise -> error "TODO"
-    _ -> error $ "sorry, can't help with this motive: " ++ show info
-  Sym{} -> error "can't motivate evaluation of symbolic value"
-evalMotive (MEq lst) = \case
-  ListCat a b -> pure $ sEval a .++ sEval b .== sEval lst
-  ListMap{} -> error "XXX tricky"
-  ListAt{} -> error "nested lists not allowed"
-  ListInfo litLst  -> error "TODO"
-    -- do
-    -- ifor_ litLst $ \i val -> constrain $
-    --   sEval lst .!! fromIntegral i .== literal val
-  Sym{} -> error "can't motivate evaluation of symbolic value"
-evalMotive (MAt i a) = \case
-  ListCat l1 l2 -> do
+evalMotive _ ListAt{} = error "nested lists not allowed"
+evalMotive _ Sym{}    = error "can't motivate evaluation of symbolic value"
+
+evalMotive (MLength len) (ListCat a b) = do
+  [al, bl] <- sIntegers ["al", "bl"]
+  let totalLen = al + bl .== sEval len
+  aLen <- evalMotive (MLength (Sym al)) a
+  bLen <- evalMotive (MLength (Sym bl)) b
+  pure $ totalLen &&& aLen &&& bLen
+evalMotive (MLength len) (ListMap _ lst) = evalMotive (MLength len) lst
+evalMotive (MLength len) (ListInfo i) =
+  let lenV = sEval len
+  in case i of
+       LenInfo (SListLength len') -> pure $ len'                    .== lenV
+       LitList l                  -> pure $ fromIntegral (length l) .== lenV
+       _                          -> error $
+         "sorry, can't help with this motive: " ++ show i
+
+evalMotive (MAll f) (ListCat a b) = (&&&)
+  <$> evalMotive (MAll f) a
+  <*> evalMotive (MAll f) b
+evalMotive (MAll f) (ListMap g lst) = evalMotive (MAll (f . g)) lst
+evalMotive (MAll f) (ListInfo i) = case i of
+  AllInfo (SAll g) -> do
+    j <- forall_
+    -- g is at least as strong an assumption as f.
+    -- example:
+    -- f: for all i: elements of the list, i > 0
+    -- g: i need to know that for all i: elements of the list, i > -1
+    let fEval = sEval $ f $ Sym j
+        gEval = sEval $ g $ Sym j
+    pure $ gEval ==> fEval
+  LenInfo (SListLength len)
+    | Just 0 <- unliteral len -> pure true
+    | otherwise -> error "TODO"
+  _ -> error $ "sorry, can't help with this motive: " ++ show i
+
+evalMotive (MAny f) (ListCat a b) = (|||)
+  <$> evalMotive (MAny f) a
+  <*> evalMotive (MAny f) b
+evalMotive (MAny f) (ListMap g lst) = evalMotive (MAny (f . g)) lst
+evalMotive (MAny f) (ListInfo info) = case info of
+  AnyInfo (SAny g) -> do
+    j <- exists_
+    let fEval = sEval $ f $ Sym j
+        gEval = sEval $ g $ Sym j
+    pure $ gEval ==> fEval
+  LenInfo (SListLength len)
+    | Just 0 <- unliteral len -> pure false
+    | otherwise -> error "TODO"
+  _ -> error $ "sorry, can't help with this motive: " ++ show info
+
+evalMotive (MAt i a) (ListCat l1 l2) = do
     let l1' = sEval l1
         l2' = sEval l2
         i'  = sEval i
@@ -360,22 +327,20 @@ evalMotive (MAt i a) = \case
     pure $
       l1' .!! i'                     .== a' |||
       l2' .!! (i' - SBVL.length l1') .== a'
-  ListMap{} -> error "XXX tricky 3"
-  ListAt{} -> error "nested lists not allowed"
-  ListInfo litLst -> error "TODO"
+evalMotive (MAt i _) (ListMap _ lst) = evalMotive (MAt i (error "TODO")) lst
+evalMotive (MAt i a) (ListInfo info) = case info of
+  LitList litList -> pure $
+    let iV = sEval i
+        aV = sEval a
+    in fromIntegral (length litList) .> iV &&&
+       (SBVL.implode litList SBVL..!! iV) .== aV
+
+  _ -> error "can't help with this motive"
   -- ifor_ litLst $ \j val -> constrain $
   --   fromIntegral j .== i ==> literal val .== a
-  Sym{} -> error "can't motivate evaluation of symbolic value"
-evalMotive motive@(MContains a) = \case
-  ListCat l1 l2 -> (|||)
-    <$> evalMotive motive l1
-    <*> evalMotive motive l2
-  ListMap{} -> error "XXX tricky 4"
-  ListAt{} -> error "nested lists not allowed"
-  ListInfo litLst -> error "TODO"
-  -- for_ litLst $ \val -> constrain $
-  --   literal val .== a
-  Sym{} -> error "can't motivate evaluation of symbolic value"
+
+evalMotive (MNegate (MAll f)) lst = evalMotive (MAny (Not . f)) lst
+evalMotive (MNegate (MAny f)) lst = evalMotive (MAll (Not . f)) lst
 
 main :: IO ()
 main = do
@@ -411,12 +376,18 @@ main = do
   --       l = ListInfo (LenInfo (SListLength 2))
   --   pure $ sEval $ Eq (LitI 2) (ListLen l)
 
+  let l0 :: Expr 'IntTy
+      l0 = LitI 0
+
+      gt0 :: Expr 'IntTy -> Expr 'BoolTy
+      gt0 x = Gt x l0
+
+      lte0 :: Expr 'IntTy -> Expr 'BoolTy
+      lte0 x = Not (Gt x l0)
+
   makeReport "length [] == 0 (expect good)" $ do
     let lst = ListInfo (LenInfo (SListLength 0)) :: Expr ('List 'IntTy)
-    constrain =<< evalMotive (Length (LitI 0)) lst
-
-  let gt0 :: Expr 'IntTy -> Expr 'BoolTy
-      gt0 x = Gt x (LitI 0)
+    constrain =<< evalMotive (MLength l0) lst
 
   -- show that the result of a mapping is all positive
   makeReport "fmap (> 0) lst == true (expect good)" $ do
@@ -428,7 +399,7 @@ main = do
       almostAllPos = ListCat
         (ListInfo (AllInfo (SAll gt0)))
         (ListCat
-          (ListInfo (AllInfo (SAll (Eq (LitI 0)))))
+          (ListInfo (AllInfo (SAll (Eq l0))))
           (ListInfo (AllInfo (SAll gt0))))
   makeReport "fmap (> 0) almostAllPos == true (expect bad)" $ do
     constrain =<< evalMotive (MAll gt0) almostAllPos
@@ -440,22 +411,37 @@ main = do
     x <- evalMotive (MAll (Eq true')) $ ListInfo $ LenInfo $ SListLength 0
     constrain $ bnot x
 
+  let mkAnd :: SBV Bool -> ListInfo 'BoolTy
+      mkAnd = AllInfo . SAll . Eq . Sym
+
   makeReport "(and [true]) == true (expect good)" $
-    constrain <=< evalMotive (MAll (Eq true')) $ ListInfo $ AndInfo $ SAnd true
+    constrain <=< evalMotive (MAll (Eq true')) $ ListInfo $ mkAnd true -- AndInfo $ SAnd true
       -- Lit [true]
 
   makeReport "(and [false]) == true (expect bad)" $
-    constrain <=< evalMotive (MAll (Eq true')) $ ListInfo $ AndInfo $ SAnd false
+    constrain <=< evalMotive (MAll (Eq true')) $ ListInfo $ mkAnd false -- AndInfo $ SAnd false
       -- Lit [false]
 
-  makeReport "(not (and [false])) == true (expect good)" $ do
-    x <- evalMotive (MAll (Eq true')) $ ListInfo $ AndInfo $ SAnd false
-    constrain $ bnot x
+  makeReport "and [false] /= true (expect good)" $ do
+    constrain <=< evalMotive (MAll (Eq true')) $
+      ListInfo $ mkAnd false -- AndInfo $ SAnd false
       -- Lit [false]
 
-  makeReport "fmap (> 0) (all [> 0]) == true (expect good)" $ do
-    constrain <=< evalMotive (MAll gt0) $ ListInfo $ AllInfo $
+  makeReport "not (any (> 0) (all [> 0])) == false (expect bad)" $ do
+    constrain <=< evalMotive (MNegate (MAny gt0)) $ ListInfo $ AllInfo $
       SAll gt0
+
+  makeReport "not (all (> 0) (any [<= 0])) == true (expect good)" $ do
+    constrain <=< evalMotive (MNegate (MAll gt0)) $ ListInfo $ AnyInfo $
+      SAny lte0
+
+  makeReport "at 2 [1, 2, 3] == 3 (expect good)" $ do
+    constrain <=< evalMotive (MAt (LitI 2) (LitI 3)) $ ListInfo $ LitList
+      [1, 2, 3]
+
+  makeReport "at 2 [1, 2, 3] == 2 (expect bad)" $ do
+    constrain <=< evalMotive (MAt (LitI 2) (LitI 2)) $ ListInfo $ LitList
+      [1, 2, 3]
 
 true', false' :: Expr 'BoolTy
 true'  = LitB true
