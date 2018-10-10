@@ -65,11 +65,6 @@ instance Semigroup SAnd where
 instance Monoid SAnd where
   mempty = SAnd false
 
-data SCmp = SCmp (SBV Integer -> SBV Bool) -- Ordering (SBV Integer)
-
-instance Show SCmp where
-  show _ = "SCmp"
-
 -- TODO: contains monoid
 
 cons :: Monoid a => a -> FoldedList a -> FoldedList a
@@ -149,7 +144,6 @@ data ListInfo a where
   AllInfo :: SAll 'IntTy        -> ListInfo 'IntTy
   OrInfo  :: SOr                -> ListInfo 'BoolTy
   AndInfo :: SAnd               -> ListInfo 'BoolTy
-  CmpInfo :: SCmp               -> ListInfo 'IntTy
 
 instance Show (ListInfo a) where
   showsPrec p li = showParen (p > 10) $ case li of
@@ -159,7 +153,6 @@ instance Show (ListInfo a) where
     AllInfo i -> showString "AllInfo " . showsPrec 11 i
     OrInfo  i -> showString "OrInfo "  . showsPrec 11 i
     AndInfo i -> showString "AndInfo " . showsPrec 11 i
-    CmpInfo i -> showString "CmpInfo " . showsPrec 11 i
 
 instance Show (Expr ty) where
   showsPrec p expr = showParen (p > 10) $ case expr of
@@ -319,17 +312,12 @@ evalMotive (MAll f) = \case
     AndInfo (SAnd b) -> pure $ sEval $ f $ Sym b
     AllInfo (SAll g) -> do
       j <- forall_
-      let fEval = sEval $ f $ Sym j
-          gEval = sEval $ g $ Sym j
-      pure $ gEval ==> fEval
-    CmpInfo (SCmp g) -> do
       -- g is at least as strong an assumption as f.
       -- example:
       -- f: for all i: elements of the list, i > 0
       -- g: i need to know that for all i: elements of the list, i > -1
-      j <- forall_
       let fEval = sEval $ f $ Sym j
-          gEval =         g       j
+          gEval = sEval $ g $ Sym j
       pure $ gEval ==> fEval
     LenInfo (SListLength len)
       | Just 0 <- unliteral len -> pure true
@@ -427,20 +415,23 @@ main = do
     let lst = ListInfo (LenInfo (SListLength 0)) :: Expr ('List 'IntTy)
     constrain =<< evalMotive (Length (LitI 0)) lst
 
+  let gt0 :: Expr 'IntTy -> Expr 'BoolTy
+      gt0 x = Gt x (LitI 0)
+
   -- show that the result of a mapping is all positive
   makeReport "fmap (> 0) lst == true (expect good)" $ do
-    let lst = ListInfo (CmpInfo (SCmp (.> 0))) :: Expr ('List 'IntTy)
+    let lst = ListInfo (AllInfo (SAll gt0)) :: Expr ('List 'IntTy)
 
-    constrain =<< evalMotive (MAll (\x -> (Gt x (LitI 0)))) lst
+    constrain =<< evalMotive (MAll gt0) lst
 
   let almostAllPos :: Expr ('List 'IntTy)
       almostAllPos = ListCat
-        (ListInfo (CmpInfo (SCmp (.> 0))))
+        (ListInfo (AllInfo (SAll gt0)))
         (ListCat
-          (ListInfo (CmpInfo (SCmp (.== 0))))
-          (ListInfo (CmpInfo (SCmp (.> 0)))))
+          (ListInfo (AllInfo (SAll (Eq (LitI 0)))))
+          (ListInfo (AllInfo (SAll gt0))))
   makeReport "fmap (> 0) almostAllPos == true (expect bad)" $ do
-    constrain =<< evalMotive (MAll (\x -> (Gt x (LitI 0)))) almostAllPos
+    constrain =<< evalMotive (MAll gt0) almostAllPos
 
   makeReport "(and []) == true (expect good)" $
     constrain <=< evalMotive (MAll (Eq true')) $ ListInfo $ LenInfo $ SListLength 0
@@ -463,8 +454,8 @@ main = do
       -- Lit [false]
 
   makeReport "fmap (> 0) (all [> 0]) == true (expect good)" $ do
-    constrain <=< evalMotive (MAll (\x -> Gt x (LitI 0))) $ ListInfo $ AllInfo $
-      SAll (\x -> Gt x (LitI 0))
+    constrain <=< evalMotive (MAll gt0) $ ListInfo $ AllInfo $
+      SAll gt0
 
 true', false' :: Expr 'BoolTy
 true'  = LitB true
