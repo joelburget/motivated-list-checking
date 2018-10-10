@@ -22,47 +22,6 @@ import qualified Data.SBV.List as SBVL
 import           Prelude       as P hiding (concat)
 
 
--- A list represented as the result of a fold
-newtype FoldedList a = FoldedList { unFoldedList :: a }
-  deriving (Show, Functor)
-
-newtype SListLength = SListLength { unSListLength :: SBV Integer }
-  deriving Show
-
-instance Semigroup SListLength where
-  SListLength x <> SListLength y = SListLength $ x + y
-
-instance Monoid SListLength where
-  mempty = SListLength 0
-
-data SAny a = SAny (Expr a -> Expr 'BoolTy)
-
-instance HasKind (Concrete a) => Show (SAny a) where
-  show (SAny f) = show (f (Sym (uninterpret "x")))
-
--- Just use SAnd if you need a boolean predicate
-data SAll a = SAll (Expr a -> Expr 'BoolTy)
-
-instance HasKind (Concrete a) => Show (SAll a) where
-  show (SAll f) = show (f (Sym (uninterpret "x")))
-
--- TODO: contains monoid
-
-cons :: Monoid a => a -> FoldedList a -> FoldedList a
-cons a (FoldedList f) = FoldedList $ a <> f
-
-snoc :: Monoid a => FoldedList a -> a -> FoldedList a
-snoc (FoldedList f) a = FoldedList $ f <> a
-
-concat :: Monoid a => FoldedList a -> FoldedList a -> FoldedList a
-concat (FoldedList a) (FoldedList a') = FoldedList $ a <> a'
-
-implode :: Monoid a => [a] -> FoldedList a
-implode = FoldedList . mconcat
-
-singleton :: Monoid a => a -> FoldedList a
-singleton = FoldedList
-
 data Ty
   = List Ty
   | IntTy
@@ -121,16 +80,16 @@ data Expr ty where
 
 data ListInfo a where
   LitList :: [SBV (Concrete a)] -> ListInfo a
-  LenInfo :: SListLength        -> ListInfo a
-  AnyInfo :: SAny 'IntTy        -> ListInfo 'IntTy
-  AllInfo :: SAll a             -> ListInfo a
+  LenInfo :: SBV Integer        -> ListInfo a
+  AnyInfo :: (Expr 'IntTy -> Expr 'BoolTy) -> ListInfo 'IntTy
+  AllInfo :: (Expr a -> Expr 'BoolTy)             -> ListInfo a
 
 instance HasKind (Concrete a) => Show (ListInfo a) where
   showsPrec p li = showParen (p > 10) $ case li of
     LitList l -> showString "LitList " . showsPrec 11 l
     LenInfo i -> showString "LenInfo " . showsPrec 11 i
-    AnyInfo i -> showString "AnyInfo " . showsPrec 11 i
-    AllInfo i -> showString "AllInfo " . showsPrec 11 i
+    AnyInfo f -> showString "AnyInfo " . showsPrec 11 (f (Sym (uninterpret "x")))
+    AllInfo f -> showString "AllInfo " . showsPrec 11 (f (Sym (uninterpret "x")))
 
 instance Show (Expr ty) where
   showsPrec p expr = showParen (p > 10) $ case expr of
@@ -280,9 +239,9 @@ evalMotive (MLength len) (ListMap _ lst) = evalMotive (MLength len) lst
 evalMotive (MLength len) (ListInfo i) =
   let lenV = sEval len
   in case i of
-       LenInfo (SListLength len') -> pure $ len'                    .== lenV
-       LitList l                  -> pure $ fromIntegral (length l) .== lenV
-       _                          -> error $
+       LenInfo len' -> pure $ len'                    .== lenV
+       LitList l    -> pure $ fromIntegral (length l) .== lenV
+       _            -> error $
          "sorry, can't help with this motive: " ++ show i
 
 evalMotive (MAll f) (ListCat a b) = (&&&)
@@ -290,7 +249,7 @@ evalMotive (MAll f) (ListCat a b) = (&&&)
   <*> evalMotive (MAll f) b
 evalMotive (MAll f) (ListMap g lst) = evalMotive (MAll (f . g)) lst
 evalMotive (MAll f) (ListInfo i) = case i of
-  AllInfo (SAll g) -> do
+  AllInfo g -> do
     j <- forall_
     -- g is at least as strong an assumption as f.
     -- example:
@@ -299,9 +258,10 @@ evalMotive (MAll f) (ListInfo i) = case i of
     let fEval = sEval $ f $ Sym j
         gEval = sEval $ g $ Sym j
     pure $ gEval ==> fEval
-  LenInfo (SListLength len)
+  LenInfo len
     | Just 0 <- unliteral len -> pure true
     | otherwise -> error "TODO"
+  LitList l -> pure $ foldr (&&&) true (fmap (sEval . f . Sym) l)
   _ -> error $ "sorry, can't help with this motive: " ++ show i
 
 evalMotive (MAny f) (ListCat a b) = (|||)
@@ -309,14 +269,15 @@ evalMotive (MAny f) (ListCat a b) = (|||)
   <*> evalMotive (MAny f) b
 evalMotive (MAny f) (ListMap g lst) = evalMotive (MAny (f . g)) lst
 evalMotive (MAny f) (ListInfo info) = case info of
-  AnyInfo (SAny g) -> do
+  AnyInfo g -> do
     j <- exists_
     let fEval = sEval $ f $ Sym j
         gEval = sEval $ g $ Sym j
     pure $ gEval ==> fEval
-  LenInfo (SListLength len)
+  LenInfo len
     | Just 0 <- unliteral len -> pure false
     | otherwise -> error "TODO"
+  LitList l -> pure $ foldr (|||) false (fmap (sEval . f . Sym) l)
   _ -> error $ "sorry, can't help with this motive: " ++ show info
 
 evalMotive (MAt i a) (ListCat l1 l2) = do
@@ -345,37 +306,6 @@ evalMotive (MNegate (MAny f)) lst = evalMotive (MAll (Not . f)) lst
 main :: IO ()
 main = do
 
-  -- print <=< prove $
-  makeReport "(len 2) + (len 4) == len 6 (expect good)" $ do
-    let len = unSListLength $ unFoldedList $
-          FoldedList (SListLength 2) `concat` FoldedList (SListLength 4)
-    constrain $ len .== 6
-
-  makeReport "true (expect good)"  $
-    constrain true
-
-  makeReport "false (expect bad)" $
-    constrain false
-
-  {-
-  print <=< prove $ unSAll $ unFoldedList $
-    implode $ SOr . (.> 0) <$> [ 1, 2, 3 :: SBV Integer ]
-
-  print <=< prove $ unSAll $ unFoldedList $
-    implode $ SOr . (.> 0) <$> [ -1, 2, 3 :: SBV Integer ]
-
-  print <=< prove $ do
-    a <- sInteger "a"
-    pure $ unSAll $ unFoldedList $
-      implode $ SOr . (.> 0) <$> [ a, 2, 3 :: SBV Integer ]
-  -}
-
-  -- TODO
-  -- print <=< prove $ do
-  --   let l :: Expr ('List 'IntTy)
-  --       l = ListInfo (LenInfo (SListLength 2))
-  --   pure $ sEval $ Eq (LitI 2) (ListLen l)
-
   let l0 :: Expr 'IntTy
       l0 = LitI 0
 
@@ -385,34 +315,57 @@ main = do
       lte0 :: Expr 'IntTy -> Expr 'BoolTy
       lte0 x = Not (Gt x l0)
 
+  makeReport "any (> 0) [1, 2, 3] (expect good)" $ do
+    let lst = ListInfo (LitList [1, 2, 3])
+    constrain =<< evalMotive (MAny gt0) lst
+
+  makeReport "any (> 0) [-1, 2, 3] (expect good)" $ do
+    let lst = ListInfo (LitList [-1, 2, 3])
+    constrain =<< evalMotive (MAny gt0) lst
+
+  makeReport "any (> 0) [a, -1, 3] (expect good)" $ do
+    a <- sInteger "a"
+    let lst = ListInfo (LitList [a, -1, 3])
+    constrain =<< evalMotive (MAny gt0) lst
+
+  makeReport "all (> 0) [a, -1, 3] (expect bad)" $ do
+    a <- sInteger "a"
+    let lst = ListInfo (LitList [a, -1, 3])
+    constrain =<< evalMotive (MAll gt0) lst
+
   makeReport "length [] == 0 (expect good)" $ do
-    let lst = ListInfo (LenInfo (SListLength 0)) :: Expr ('List 'IntTy)
+    let lst = ListInfo (LenInfo 0) :: Expr ('List 'IntTy)
     constrain =<< evalMotive (MLength l0) lst
+
+  makeReport "length (len 2) == 2 (expect good)" $ do
+    let lst :: Expr ('List 'IntTy)
+        lst = ListInfo (LenInfo 2)
+    constrain =<< evalMotive (MLength (LitI 2)) lst
 
   -- show that the result of a mapping is all positive
   makeReport "fmap (> 0) lst == true (expect good)" $ do
-    let lst = ListInfo (AllInfo (SAll gt0)) :: Expr ('List 'IntTy)
+    let lst = ListInfo (AllInfo gt0) :: Expr ('List 'IntTy)
 
     constrain =<< evalMotive (MAll gt0) lst
 
   let almostAllPos :: Expr ('List 'IntTy)
       almostAllPos = ListCat
-        (ListInfo (AllInfo (SAll gt0)))
+        (ListInfo (AllInfo gt0))
         (ListCat
-          (ListInfo (AllInfo (SAll (Eq l0))))
-          (ListInfo (AllInfo (SAll gt0))))
+          (ListInfo (AllInfo (Eq l0)))
+          (ListInfo (AllInfo gt0)))
   makeReport "fmap (> 0) almostAllPos == true (expect bad)" $ do
     constrain =<< evalMotive (MAll gt0) almostAllPos
 
   makeReport "(and []) == true (expect good)" $
-    constrain <=< evalMotive (MAll (Eq true')) $ ListInfo $ LenInfo $ SListLength 0
+    constrain <=< evalMotive (MAll (Eq true')) $ ListInfo $ LenInfo 0
 
   makeReport "(not (and [])) == true (expect bad)" $ do
-    x <- evalMotive (MAll (Eq true')) $ ListInfo $ LenInfo $ SListLength 0
+    x <- evalMotive (MAll (Eq true')) $ ListInfo $ LenInfo 0
     constrain $ bnot x
 
   let mkAnd :: SBV Bool -> ListInfo 'BoolTy
-      mkAnd = AllInfo . SAll . Eq . Sym
+      mkAnd = AllInfo . Eq . Sym
 
   makeReport "(and [true]) == true (expect good)" $
     constrain <=< evalMotive (MAll (Eq true')) $ ListInfo $ mkAnd true -- AndInfo $ SAnd true
@@ -428,12 +381,10 @@ main = do
       -- Lit [false]
 
   makeReport "not (any (> 0) (all [> 0])) == false (expect bad)" $ do
-    constrain <=< evalMotive (MNegate (MAny gt0)) $ ListInfo $ AllInfo $
-      SAll gt0
+    constrain <=< evalMotive (MNegate (MAny gt0)) $ ListInfo $ AllInfo gt0
 
   makeReport "not (all (> 0) (any [<= 0])) == true (expect good)" $ do
-    constrain <=< evalMotive (MNegate (MAll gt0)) $ ListInfo $ AnyInfo $
-      SAny lte0
+    constrain <=< evalMotive (MNegate (MAll gt0)) $ ListInfo $ AnyInfo lte0
 
   makeReport "at 2 [1, 2, 3] == 3 (expect good)" $ do
     constrain <=< evalMotive (MAt (LitI 2) (LitI 3)) $ ListInfo $ LitList
