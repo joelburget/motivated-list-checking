@@ -83,7 +83,7 @@ data ListInfo a where
   LenInfo :: SBV Integer                   -> ListInfo a
   AnyInfo :: (Expr a      -> Expr 'BoolTy) -> ListInfo a
   AllInfo :: (Expr a      -> Expr 'BoolTy) -> ListInfo a
-  SumInfo :: (Expr 'IntTy -> Expr 'BoolTy) -> ListInfo 'IntTy
+  SumInfo :: Expr 'IntTy -> ListInfo 'IntTy
 
 instance HasKind (Concrete a) => Show (ListInfo a) where
   showsPrec p li = showParen (p > 10) $ case li of
@@ -91,7 +91,7 @@ instance HasKind (Concrete a) => Show (ListInfo a) where
     LenInfo i -> showString "LenInfo " . showsPrec 11 i
     AnyInfo f -> showString "AnyInfo " . showsPrec 11 (f (Sym (uninterpret "x")))
     AllInfo f -> showString "AllInfo " . showsPrec 11 (f (Sym (uninterpret "x")))
-    SumInfo f -> showString "SumInfo " . showsPrec 11 (f (Sym (uninterpret "x")))
+    SumInfo i -> showString "SumInfo " . showsPrec 11 i
 
 instance Show (Expr ty) where
   showsPrec p expr = showParen (p > 10) $ case expr of
@@ -217,13 +217,14 @@ sEval = \case
 
 -- The motive for consuming a list of type @a@
 data Motive a where
-  MLength   :: Expr 'IntTy                   -> Motive a
-  MAt       :: Expr 'IntTy -> Expr a         -> Motive a
-  MNegate   :: Motive a                      -> Motive a
+  MLength   :: Expr 'IntTy              -> Motive a
+  MAt       :: Expr 'IntTy -> Expr a    -> Motive a
+  MNegate   :: Motive a                 -> Motive a
 
-  MAll      :: (Expr a      -> Expr 'BoolTy) -> Motive a
-  MAny      :: (Expr a      -> Expr 'BoolTy) -> Motive a
-  MSum      :: (Expr 'IntTy -> Expr 'BoolTy) -> Motive 'IntTy
+  MAll      :: (Expr a -> Expr 'BoolTy) -> Motive a
+  MAny      :: (Expr a -> Expr 'BoolTy) -> Motive a
+  MSum      :: (Expr a -> Expr 'IntTy)
+            -> Expr 'IntTy              -> Motive a
   -- MFold
 
 evalMotive
@@ -283,19 +284,23 @@ evalMotive (MAny f) (ListInfo info) = case info of
   LitList l -> pure $ foldr (|||) false (fmap (sEval . f . Sym) l)
   _ -> error $ "sorry, can't help with this motive: " ++ show info
 
-evalMotive (MSum f) (ListCat a b) = do
-  [aV, bV] <- sIntegers ["aV", "bV"]
-  constrain $ sEval $ f $ Sym $ aV + bV
+evalMotive (MSum f target) (ListCat a b) = do
+  [targetA, targetB] <- sIntegers ["targetA", "targetB"]
+  let sV = sEval target
+  constrain $ sV .== targetA + targetB
   (&&&)
-    <$> evalMotive (MSum (Eq (Sym aV))) a
-    <*> evalMotive (MSum (Eq (Sym bV))) b
-evalMotive (MSum f) (ListInfo info) = case info of
-  SumInfo g -> do
-    j <- exists_
-    let fEval = sEval $ f $ Sym j
-        gEval = sEval $ g $ Sym j
-    pure $ gEval ==> fEval
+    <$> evalMotive (MSum f (Sym targetA)) a
+    <*> evalMotive (MSum f (Sym targetB)) b
+evalMotive (MSum f target) (ListInfo info) = case info of
+  SumInfo i -> do
+    pure $ sEval (f i) .== sEval target
+  LenInfo len
+    | Just cLen <- unliteral len -> do
+      vars <- mkExistVars (fromIntegral cLen)
+      pure $ sum (fmap (sEval . f . Sym) vars) .== sEval target
   _ -> error $ "sorry, can't help with this motive: " ++ show info
+evalMotive (MSum f target) (ListMap g lst) =
+  evalMotive (MSum (f . g) target) lst
 
 evalMotive (MAt i a) (ListCat l1 l2) = do
     let l1' = sEval l1
@@ -315,8 +320,12 @@ evalMotive (MAt i a) (ListInfo info) = case info of
 
   _ -> error "can't help with this motive"
 
-evalMotive (MNegate (MAll f)) lst = evalMotive (MAny (Not . f)) lst
-evalMotive (MNegate (MAny f)) lst = evalMotive (MAll (Not . f)) lst
+evalMotive (MNegate (MAll f)) lst    = evalMotive (MAny (Not . f)) lst
+evalMotive (MNegate (MAny f)) lst    = evalMotive (MAll (Not . f)) lst
+evalMotive (MNegate MLength{}) _lst  = error "TODO"
+evalMotive (MNegate MAt{}) _lst      = error "TODO"
+evalMotive (MNegate (MNegate m)) lst = evalMotive m lst
+evalMotive (MNegate MSum{}) _lst     = error "TODO"
 
 l0 :: Expr 'IntTy
 l0 = LitI 0
@@ -410,11 +419,16 @@ main = do
 
   let sumTo7 :: Expr ('List 'IntTy)
       sumTo7 = ListCat
-        (ListInfo (SumInfo (Eq (LitI 3))))
-        (ListInfo (SumInfo (Eq (LitI 4))))
+        (ListInfo (SumInfo (LitI 3)))
+        (ListInfo (SumInfo (LitI 4)))
 
-  makeReport "sum almostAllPos == 7 (expect good)" $ do
-    constrain =<< evalMotive (MSum (Eq (LitI 7))) sumTo7
+  makeReport "sum sumTo7 == 7 (expect good)" $ do
+    constrain =<< evalMotive (MSum id (LitI 7)) sumTo7
+
+  makeReport "sum (map (const 1) [length 7]) == 7 (expect good)" $ do
+    let lst :: Expr ('List 'IntTy)
+        lst = ListInfo (LenInfo 7)
+    constrain =<< evalMotive (MSum (const (LitI 1)) (LitI 7)) lst
 
 true', false' :: Expr 'BoolTy
 true'  = LitB true
