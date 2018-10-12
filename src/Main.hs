@@ -18,10 +18,10 @@
 {-# LANGUAGE StandaloneDeriving   #-}
 module Main where
 
-import           Control.Monad ((<=<))
 import           Data.SBV
 import           Data.SBV.List ((.!!), (.++))
 import qualified Data.SBV.List as SBVL
+import           EasyTest
 import           Prelude       as P hiding (concat)
 
 
@@ -303,40 +303,23 @@ lte0 x = Not (Gt x 0)
 mkAnyM :: (Expr a -> Expr 'BoolTy) -> ListInfo a
 mkAnyM f = FoldInfo (bnot . f) And false
 
+mkTest
+  :: forall a. Suitable a
+  => Validity -> ListInfo a -> Symbolic (Expr ('List a)) -> Test ()
+mkTest expectValid motive expr = do
+  (valid, vacuous) <- io $ do
+    let constraints = constrain =<< evalMotive motive =<< expr
+    (,) <$> isTheorem constraints <*> isVacuous constraints
+
+  expect $ if expectValid == Valid
+    then valid
+    else (not valid || vacuous)
+
+data Validity = Valid | Invalid
+  deriving Eq
+
 main :: IO ()
 main = do
-  makeReport "any (> 0) [1, 2, 3] (expect good)" $ do
-    let lst = ListInfo (LitList [1, 2, 3])
-    constrain =<< evalMotive (mkAnyM gt0) lst
-
-  makeReport "any (> 0) [-1, 2, 3] (expect good)" $ do
-    let lst = ListInfo (LitList [-1, 2, 3])
-    constrain =<< evalMotive (mkAnyM gt0) lst
-
-  makeReport "any (> 0) [a, -1, 3] (expect good)" $ do
-    a <- sInteger "a"
-    let lst = ListInfo (LitList [a, -1, 3])
-    constrain =<< evalMotive (mkAnyM gt0) lst
-
-  makeReport "all (> 0) [a, -1, 3] (expect bad)" $ do
-    a <- sInteger "a"
-    let lst = ListInfo (LitList [a, -1, 3])
-    constrain =<< evalMotive (FoldInfo gt0 And true) lst
-
-  makeReport "length [] == 0 (expect good)" $ do
-    let lst = ListInfo (LenInfo 0) :: Expr ('List 'IntTy)
-    constrain =<< evalMotive (LenInfo 0) lst
-
-  makeReport "length (len 2) == 2 (expect good)" $ do
-    let lst :: Expr ('List 'IntTy)
-        lst = ListInfo (LenInfo 2)
-    constrain =<< evalMotive (LenInfo 2) lst
-
-  -- show that the result of a mapping is all positive
-  makeReport "fmap (> 0) lst == true (expect good)" $ do
-    let lst = ListInfo (AllInfo gt0) :: Expr ('List 'IntTy)
-    constrain =<< evalMotive (FoldInfo gt0 And true) lst
-
   let almostAllPos :: Expr ('List 'IntTy)
       almostAllPos = ListCat
         (ListInfo (AllInfo gt0))
@@ -344,81 +327,91 @@ main = do
           (ListInfo (AllInfo (Eq 0)))
           (ListInfo (AllInfo gt0)))
 
-  makeReport "fmap (> 0) almostAllPos == true (expect bad)" $
-    constrain =<< evalMotive (FoldInfo gt0 And true) almostAllPos
-
-  makeReport "(and []) == true (expect good)" $
-    constrain =<< evalMotive (FoldInfo (Eq @'BoolTy true) And true) (ListInfo (LenInfo 0))
-
-  makeReport "(not (and [])) == true (expect bad)" $ do
-    x <- evalMotive (FoldInfo (Eq @'BoolTy true) And true) (ListInfo (LenInfo 0))
-    constrain $ bnot x
-
-  let mkAnd :: SBV Bool -> ListInfo 'BoolTy
-      mkAnd = AllInfo . Eq . Sym
-
-  makeReport "(and [true]) == true (expect good)" $
-    constrain <=< evalMotive (FoldInfo (Eq true) And true) $ ListInfo $ mkAnd true -- AndInfo $ SAnd true
-
-  makeReport "(and [false]) == true (expect bad)" $
-    constrain =<< evalMotive
-      (FoldInfo (Eq true) And true)
-      (ListInfo $ FoldInfo id And false)
-      -- Lit [false]
-
-  makeReport "and [false] /= true (expect good)" $
-    constrain =<< evalMotive
-      (FoldInfo (Eq true) And false)
-      (ListInfo (FoldInfo id And false))
-
-  makeReport "all (> 0) => (not (any (> 0)) == false) (expect bad)" $
-    constrain =<< evalMotive
-      (FoldInfo gt0 And false)
-      (ListInfo (AllInfo gt0))
-
-  makeReport "any (<= 0) => not (all (> 0)) (expect good)" $
-    constrain =<< evalMotive
-      (FoldInfo gt0 And false)
-      -- (ListInfo (FoldInfo lte0 Or true))
-      -- <=>
-      (ListInfo (FoldInfo (bnot . lte0) And false))
-
-  makeReport "at 2 [1, 2, 3] == 3 (expect good)" $
-    constrain =<< evalMotive
-      (AtInfo (LitI 2) (LitI 3))
-      (ListInfo $ LitList [1, 2, 3])
-
-  makeReport "at 2 [1, 2, 3] == 2 (expect bad)" $
-    constrain =<< evalMotive
-      (AtInfo (LitI 2) (LitI 2))
-      (ListInfo $ LitList [1, 2, 3])
-
-  let sumTo7 :: Expr ('List 'IntTy)
+      sumTo7 :: Expr ('List 'IntTy)
       sumTo7 = ListCat
         (ListInfo (FoldInfo id Add 3))
         (ListInfo (FoldInfo id Add 4))
 
-  makeReport "sum sumTo7 == 7 (expect good)" $
-    constrain =<< evalMotive (FoldInfo id Add 7) sumTo7
+  run $ tests
+    [ scope "any (> 0) [1, 2, 3]" $
+        mkTest Valid (mkAnyM gt0) $ pure $ ListInfo $ LitList [1, 2, 3]
+    , scope "any (> 0) [-1, 2, 3]" $
+        mkTest Valid (mkAnyM gt0) $ pure $ ListInfo $ LitList [-1, 2, 3]
 
-  makeReport "sum (map (const 1) [length 7]) == 7 (expect good)" $ do
-    let lst :: Expr ('List 'IntTy)
-        lst = ListInfo (LenInfo 7)
-    constrain =<< evalMotive (FoldInfo (const 1) Add 7) lst
+    , scope "any (> 0) [a, -1, 3]" $ do
+        mkTest Valid (mkAnyM gt0) $ do
+          a <- sInteger "a"
+          pure $ ListInfo $ LitList [a, -1, 3]
 
-makeReport :: String -> Symbolic () -> IO ()
-makeReport header a = do
-  putStrLn $ '\n' : header
-  ThmResult provable <- prove a
-  -- putStrLn $ "provable:    " ++ show provable
-  -- SatResult satisfiable <- sat a
-  -- putStrLn $ "satisfiable: " ++ show satisfiable
-  vacuous <- isVacuous a
-  -- putStrLn $ "vacuous:     " ++ show vacuous
-  putStrLn $
-    if vacuous
-    then "bad (vacuous)"
-    else case provable of
-           Satisfiable{}   -> "bad (not vacuous)"
-           Unsatisfiable{} -> "good"
-           _               -> show $ ThmResult provable
+    , scope "all (> 0) [a, -1, 3] (expect bad)" $
+      mkTest Invalid (FoldInfo gt0 And true) $ do
+        a <- sInteger "a"
+        pure $ ListInfo $ LitList [a, -1, 3]
+
+    , scope "length [] == 0" $ do
+        let lst = ListInfo (LenInfo 0) :: Expr ('List 'IntTy)
+        mkTest Valid (LenInfo 0) $ pure lst
+
+    , scope "length (len 2) == 2" $ do
+        let lst :: Expr ('List 'IntTy)
+            lst = ListInfo (LenInfo 2)
+        mkTest Valid (LenInfo 2) $ pure lst
+
+      -- show that the result of a mapping is all positive
+    , scope "fmap (> 0) lst == true" $ do
+        let lst = ListInfo (AllInfo gt0) :: Expr ('List 'IntTy)
+        mkTest Valid (FoldInfo gt0 And true) $ pure lst
+
+    , scope "fmap (> 0) almostAllPos == true" $
+        mkTest Invalid (FoldInfo gt0 And true) $ pure almostAllPos
+
+    , scope "(and []) == true" $
+        mkTest Valid (FoldInfo (Eq @'BoolTy true) And true)
+          $ pure $ ListInfo $ LenInfo 0
+
+    , scope "all (eq true) [] /= false" $ do
+        mkTest Invalid (FoldInfo (Eq @'BoolTy true) And false)
+          $ pure $ ListInfo $ LenInfo 0
+
+    , scope "(and [true]) == true" $
+        mkTest @'BoolTy Valid (FoldInfo (Eq true) And true)
+          $ pure $ ListInfo $ AllInfo $ Eq $ Sym true
+
+    , scope "(and [false]) == true" $
+        mkTest Invalid
+          (FoldInfo (Eq true) And true)
+          $ pure $ ListInfo $ FoldInfo id And false
+
+    , scope "and [false] /= true" $
+        mkTest Valid
+          (FoldInfo (Eq true) And false)
+          $ pure $ ListInfo $ FoldInfo id And false
+
+    , scope "all (> 0) => (not (any (> 0)) == false)" $
+        mkTest Invalid
+          (FoldInfo gt0 And false)
+          $ pure $ ListInfo $ AllInfo gt0
+
+    , scope "any (<= 0) => not (all (> 0))" $
+        mkTest Valid
+          (FoldInfo gt0 And false)
+          $ pure $ ListInfo $ FoldInfo (bnot . lte0) And false
+
+    , scope "at 2 [1, 2, 3] == 3" $
+        mkTest Valid
+          (AtInfo (LitI 2) (LitI 3))
+          $ pure $ ListInfo $ LitList [1, 2, 3]
+
+    , scope "at 2 [1, 2, 3] == 2" $
+        mkTest Invalid
+          (AtInfo (LitI 2) (LitI 2))
+          $ pure $ ListInfo $ LitList [1, 2, 3]
+
+    , scope "sum sumTo7 == 7" $
+        mkTest Valid (FoldInfo id Add 7) $ pure sumTo7
+
+    , scope "sum (map (const 1) [length 7]) == 7" $ do
+        let lst :: Expr ('List 'IntTy)
+            lst = ListInfo (LenInfo 7)
+        mkTest Valid (FoldInfo (const 1) Add 7) $ pure lst
+    ]
