@@ -38,26 +38,6 @@ type instance Concrete 'BoolTy   = Bool
 type Suitable a = (Show (Concrete a), SymWord (Concrete a), Literal a)
 
 data Expr ty where
-  -- list consumers
-  ListLen  :: Suitable a
-           => Expr ('List a)                   -> Expr 'IntTy
-  ListAnd  :: Expr ('List 'BoolTy)             -> Expr 'BoolTy
-  ListOr   :: Expr ('List 'BoolTy)             -> Expr 'BoolTy
-
-  ListAll  :: Suitable a
-           => (Expr a -> Expr 'BoolTy)
-           -> Expr ('List a)                   -> Expr 'BoolTy
-  ListAny  :: Suitable a
-           => (Expr a -> Expr 'BoolTy)
-           -> Expr ('List a)                   -> Expr 'BoolTy
-
-  ListEq   :: Suitable a
-           => Expr ('List a) -> Expr ('List a) -> Expr 'BoolTy
-  ListAt   :: Expr ('List a) -> Expr 'IntTy    -> Expr a
-  ListContains
-           :: Suitable a
-           => Expr ('List a) -> Expr a         -> Expr 'BoolTy
-
   -- transducers
   ListCat  :: Suitable a
            => Expr ('List a) -> Expr ('List a) -> Expr ('List a)
@@ -65,7 +45,7 @@ data Expr ty where
            => (Expr a -> Expr b)
            ->                   Expr ('List a) -> Expr ('List b)
 
-  -- producers
+  -- producers / information
   -- TODO: use Suitable?
   ListInfo :: HasKind (Concrete a) => ListInfo a -> Expr ('List a)
 
@@ -104,9 +84,11 @@ data Fold a where
 deriving instance Show (Fold a)
 
 data ListInfo a where
-  LitList :: [SBV (Concrete a)]                      -> ListInfo a
-  LenInfo :: SBV Integer                             -> ListInfo a
-  FoldInfo :: (Expr a -> Expr b) -> Fold b -> Expr b -> ListInfo a
+  LitList      :: [SBV (Concrete a)]                     -> ListInfo a
+  LenInfo      :: SBV Integer                            -> ListInfo a
+  FoldInfo     :: (Expr a -> Expr b) -> Fold b -> Expr b -> ListInfo a
+  AtInfo       :: Expr 'IntTy -> Expr a                  -> ListInfo a
+  ContainsInfo :: Expr a                                 -> ListInfo a
 
 pattern AnyInfo :: (b ~ 'BoolTy) => (Expr a -> Expr b) -> ListInfo a
 pattern AnyInfo f <- FoldInfo f Or  (LitB False) where
@@ -120,69 +102,56 @@ instance HasKind (Concrete a) => Show (ListInfo a) where
   showsPrec p li = showParen (p > 10) $ case li of
     LitList l -> showString "LitList " . showsPrec 11 l
     LenInfo i -> showString "LenInfo " . showsPrec 11 i
-    FoldInfo f fold empty' -> showString "FoldInfo " .
-      showsPrec 11 (f (Sym (uninterpret "x"))) .
-      showString " " .
-      showsPrec 11 fold .
-      showString " " .
-      showsPrec 11 empty'
+    FoldInfo f fold empty' ->
+        showString "FoldInfo "
+      . showsPrec 11 (f (Sym (uninterpret "x")))
+      . showString " "
+      . showsPrec 11 fold
+      . showString " "
+      . showsPrec 11 empty'
+    AtInfo i a ->
+        showString "AtInfo "
+      . showsPrec 11 i
+      . showString " "
+      . showsPrec 11 a
+    ContainsInfo a -> showString "ContainsInfo " . showsPrec 11 a
 
 instance Show (Expr ty) where
   showsPrec p expr = showParen (p > 10) $ case expr of
-    ListLen l          -> showString "ListLen " . showsPrec 11 l
-    ListAnd l          -> showString "ListAnd " . showsPrec 11 l
-    ListAll f l        ->
-      showString "ListAll " .
-      showsPrec 11 (f (Sym (uninterpret "x"))) .
-      showsPrec 11 l
-    ListAny f l        ->
-      showString "ListAny " .
-      showsPrec 11 (f (Sym (uninterpret "x"))) .
-      showsPrec 11 l
-    ListOr l           -> showString "ListOr " . showsPrec 11 l
-    ListEq a b         -> showString "ListEq " . showsPrec 11 a . showsPrec 11 b
-    ListAt lst i       ->
-      showString "ListAt " .
-      showsPrec 11 lst .
-      showString " " .
-      showsPrec 11 i
-    ListContains lst a ->
-      showString "ListContains " .
-      showsPrec 11 lst .
-      showString " " .
-      showsPrec 11 a
+    ListCat a b ->
+      showString "ListCat "
+      . showsPrec 11 a
+      . showString " "
+      . showsPrec 11 b
+    ListMap f as ->
+        showString "ListMap "
+      . showsPrec 11 (f (Sym (uninterpret "x")))
+      . showString " "
+      . showsPrec 11 as
 
-    ListCat a b        ->
-      showString "ListCat " .
-      showsPrec 11 a .
-      showString " " .
-      showsPrec 11 b
-    ListMap _ as     ->
-      showString "ListMap _ " .
-      showsPrec 11 as
-    ListInfo i         -> showString "ListInfo " . showsPrec 11 i
+    ListInfo i -> showString "ListInfo " . showsPrec 11 i
+    LitB a     -> showString "LitB " . showsPrec 11 a
+    LitI a     -> showString "LitI " . showsPrec 11 a
 
-    LitB a             -> showString "LitB " . showsPrec 11 a
-    LitI a             -> showString "LitI " . showsPrec 11 a
-    Eq a b             ->
-      showString "Eq " .
-      showsPrec 11 a .
-      showString " " .
-      showsPrec 11 b
-    Gt a b             ->
-      showString "Gt " .
-      showsPrec 11 a .
-      showString " " .
-      showsPrec 11 b
-    BinOp op a b       ->
-      showString "BinOp " .
-      showsPrec 11 op .
-      showString " " .
-      showsPrec 11 a .
-      showString " " .
-      showsPrec 11 b
-    Not a   -> showString "Not " . showsPrec 11 a
-    Sym a   -> showsPrec 11 a
+    Eq a b ->
+        showString "Eq "
+      . showsPrec 11 a
+      . showString " "
+      . showsPrec 11 b
+    Gt a b ->
+        showString "Gt "
+      . showsPrec 11 a
+      . showString " "
+      . showsPrec 11 b
+    BinOp op a b ->
+        showString "BinOp "
+      . showsPrec 11 op
+      . showString " "
+      . showsPrec 11 a
+      . showString " "
+      . showsPrec 11 b
+    Not a -> showString "Not " . showsPrec 11 a
+    Sym a -> showsPrec 11 a
 
 class Literal a where
   lit :: Concrete a -> Expr a
@@ -195,15 +164,6 @@ instance Literal 'IntTy where
 
 eval :: Expr ty -> Concrete ty
 eval = \case
-  ListLen l          -> fromIntegral $ length $ eval l
-  ListAnd l          -> and $ eval l
-  ListOr  l          -> or  $ eval l
-  ListAll f l        -> and $ fmap (eval . f . lit) $ eval l
-  ListAny f l        -> or  $ fmap (eval . f . lit) $ eval l
-  ListEq  a b        -> eval a == eval b
-  ListAt lst i       -> eval lst !! fromIntegral (eval i)
-  ListContains lst a -> eval a `elem` eval lst
-
   ListCat a b        -> eval a <> eval b
   ListMap f as       -> eval . f . lit <$> eval as
   ListInfo _         -> error "cannot evaluate list info"
@@ -223,18 +183,9 @@ eval = \case
 
 sEval :: SymWord (Concrete ty) => Expr ty -> SBV (Concrete ty)
 sEval = \case
-  ListLen l      -> SBVL.length $ sEval l
-  ListAnd _      -> error "can't fold with sbv lists"
-  ListOr  _      -> error "can't fold with sbv lists"
-  ListAll{}      -> error "can't fold with sbv lists"
-  ListAny{}      -> error "can't fold with sbv lists"
-  ListEq  a b    -> sEval a .== sEval b
-  ListAt lst i   -> sEval lst .!! sEval i
-  ListContains{} -> error "can't contains with sbv lists"
-
   ListCat a b    -> sEval a .++ sEval b
   ListMap{}      -> error "can't map with sbv lists"
-  ListInfo _     -> error "can't evaluate list info"
+  ListInfo{}     -> error "can't evaluate list info"
 
   Eq a b         -> sEval a .== sEval b
   Gt a b         -> sEval a .>  sEval b
@@ -255,12 +206,8 @@ sEval = \case
 
 -- The motive for consuming a list of type @a@
 data Motive a where
-  MLength   :: Expr 'IntTy              -> Motive a
-  MAt       :: Expr 'IntTy -> Expr a    -> Motive a
-  -- MNegate   :: Motive a                 -> Motive a
-
-  -- MAll      :: (Expr a -> Expr 'BoolTy) -> Motive a
-  -- MAny      :: (Expr a -> Expr 'BoolTy) -> Motive a
+  MLength   :: Expr 'IntTy           -> Motive a
+  MAt       :: Expr 'IntTy -> Expr a -> Motive a
   MFold
     -- consuming a list of a, where we operate on bs
     :: SymWord (Concrete b) => (Expr a -> Expr b)
@@ -273,11 +220,7 @@ data Motive a where
 evalMotive
   :: forall a. (Show (Concrete a), SymWord (Concrete a))
   => Motive a -> Expr ('List a) -> Symbolic (SBV Bool)
-evalMotive _ ListAt{} = error "nested lists not allowed"
 evalMotive _ Sym{}    = error "can't motivate evaluation of symbolic value"
-
-evalMotive MLength{} BinOp{} = error "vacuous match"
-evalMotive MAt{} BinOp{}     = error "vacuous match"
 
 evalMotive (MLength len) (ListCat a b) = do
   [al, bl] <- sIntegers ["al", "bl"]
@@ -295,7 +238,7 @@ evalMotive (MLength len) (ListInfo i) =
          "sorry, can't help with this motive: " ++ show i
 
 evalMotive (MFold mapping fold target) (ListCat a b) = do
-  [targetA, targetB] <- mkExistVars 2 -- sIntegers ["targetA", "targetB"]
+  [targetA, targetB] <- mkExistVars 2
   let append = BinOp fold
   constrain $ sEval target .== sEval (Sym targetA `append` Sym targetB)
   (&&&)
@@ -360,6 +303,9 @@ evalMotive (MAt i a) (ListInfo info) = case info of
        (SBVL.implode litList SBVL..!! iV) .== aV
 
   _ -> error "can't help with this motive"
+
+evalMotive MLength{} BinOp{} = error "vacuous match"
+evalMotive MAt{} BinOp{}     = error "vacuous match"
 
 empty :: Fold a -> Expr a
 empty = \case
