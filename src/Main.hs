@@ -9,10 +9,13 @@
 {-# LANGUAGE NamedFieldPuns       #-}
 {-# LANGUAGE OverloadedStrings    #-}
 {-# LANGUAGE ScopedTypeVariables  #-}
+{-# LANGUAGE TypeApplications     #-}
 {-# LANGUAGE TypeFamilies         #-}
 {-# LANGUAGE TypeOperators        #-}
 {-# LANGUAGE TypeSynonymInstances #-}
 {-# LANGUAGE UndecidableInstances #-}
+{-# LANGUAGE PatternSynonyms      #-}
+{-# LANGUAGE StandaloneDeriving   #-}
 module Main where
 
 import           Control.Monad ((<=<))
@@ -70,28 +73,59 @@ data Expr ty where
   Eq       :: (Eq (Concrete a), Suitable a)
            => Expr a         -> Expr a         -> Expr 'BoolTy
   Gt       :: Expr 'IntTy    -> Expr 'IntTy    -> Expr 'BoolTy
-  And      :: Expr 'BoolTy   -> Expr 'BoolTy   -> Expr 'BoolTy
-  Or       :: Expr 'BoolTy   -> Expr 'BoolTy   -> Expr 'BoolTy
   Not      ::                   Expr 'BoolTy   -> Expr 'BoolTy
+  BinOp    :: Fold a -> Expr a -> Expr a -> Expr a
 
   LitB     :: Concrete 'BoolTy                 -> Expr 'BoolTy
   LitI     :: Concrete 'IntTy                  -> Expr 'IntTy
   Sym      :: SBV (Concrete a)                 -> Expr a
 
+instance Boolean (Expr 'BoolTy) where
+  true  = LitB True
+  false = LitB False
+  bnot  = Not
+  (&&&) = BinOp And
+  (|||) = BinOp Or
+
+instance Num (Expr 'IntTy) where
+  fromInteger = LitI
+  (+)    = BinOp Add
+  (*)    = error "not supported"
+  (-)    = error "not supported"
+  negate = error "not supported"
+  abs    = error "not supported"
+  signum = error "not supported"
+
+data Fold a where
+  And :: Fold 'BoolTy
+  Or  :: Fold 'BoolTy
+  Add :: Fold 'IntTy
+
+deriving instance Show (Fold a)
+
 data ListInfo a where
-  LitList :: [SBV (Concrete a)]            -> ListInfo a
-  LenInfo :: SBV Integer                   -> ListInfo a
-  AnyInfo :: (Expr a      -> Expr 'BoolTy) -> ListInfo a
-  AllInfo :: (Expr a      -> Expr 'BoolTy) -> ListInfo a
-  SumInfo :: Expr 'IntTy -> ListInfo 'IntTy
+  LitList :: [SBV (Concrete a)]                      -> ListInfo a
+  LenInfo :: SBV Integer                             -> ListInfo a
+  FoldInfo :: (Expr a -> Expr b) -> Fold b -> Expr b -> ListInfo a
+
+pattern AnyInfo :: (b ~ 'BoolTy) => (Expr a -> Expr b) -> ListInfo a
+pattern AnyInfo f <- FoldInfo f Or  (LitB False) where
+  AnyInfo f = FoldInfo f Or  (LitB False)
+
+pattern AllInfo :: (b ~ 'BoolTy) => (Expr a -> Expr b) -> ListInfo a
+pattern AllInfo f <- FoldInfo f And (LitB True) where
+  AllInfo f = FoldInfo f And  (LitB True)
 
 instance HasKind (Concrete a) => Show (ListInfo a) where
   showsPrec p li = showParen (p > 10) $ case li of
     LitList l -> showString "LitList " . showsPrec 11 l
     LenInfo i -> showString "LenInfo " . showsPrec 11 i
-    AnyInfo f -> showString "AnyInfo " . showsPrec 11 (f (Sym (uninterpret "x")))
-    AllInfo f -> showString "AllInfo " . showsPrec 11 (f (Sym (uninterpret "x")))
-    SumInfo i -> showString "SumInfo " . showsPrec 11 i
+    FoldInfo f fold empty' -> showString "FoldInfo " .
+      showsPrec 11 (f (Sym (uninterpret "x"))) .
+      showString " " .
+      showsPrec 11 fold .
+      showString " " .
+      showsPrec 11 empty'
 
 instance Show (Expr ty) where
   showsPrec p expr = showParen (p > 10) $ case expr of
@@ -105,8 +139,8 @@ instance Show (Expr ty) where
       showString "ListAny " .
       showsPrec 11 (f (Sym (uninterpret "x"))) .
       showsPrec 11 l
-    ListOr  l          -> showString "ListOr " . showsPrec 11 l
-    ListEq  a b        -> showString "ListEq " . showsPrec 11 a . showsPrec 11 b
+    ListOr l           -> showString "ListOr " . showsPrec 11 l
+    ListEq a b         -> showString "ListEq " . showsPrec 11 a . showsPrec 11 b
     ListAt lst i       ->
       showString "ListAt " .
       showsPrec 11 lst .
@@ -140,18 +174,15 @@ instance Show (Expr ty) where
       showsPrec 11 a .
       showString " " .
       showsPrec 11 b
-    And a b            ->
-      showString "And " .
+    BinOp op a b       ->
+      showString "BinOp " .
+      showsPrec 11 op .
+      showString " " .
       showsPrec 11 a .
       showString " " .
       showsPrec 11 b
-    Or a b             ->
-      showString "Or " .
-      showsPrec 11 a .
-      showString " " .
-      showsPrec 11 b
-    Not a              -> showString "Not" . showsPrec 11 a
-    Sym a -> showsPrec 11 a
+    Not a   -> showString "Not " . showsPrec 11 a
+    Sym a   -> showsPrec 11 a
 
 class Literal a where
   lit :: Concrete a -> Expr a
@@ -179,9 +210,12 @@ eval = \case
 
   Eq a b             -> eval a == eval b
   Gt a b             -> eval a >  eval b
-  And a b            -> eval a && eval b
-  Or a b             -> eval a || eval b
   Not a              -> not (eval a)
+
+  BinOp op a b -> case op of
+    And -> eval a && eval b
+    Or  -> eval a || eval b
+    Add -> eval a +  eval b
 
   LitB a             -> a
   LitI a             -> a
@@ -204,9 +238,13 @@ sEval = \case
 
   Eq a b         -> sEval a .== sEval b
   Gt a b         -> sEval a .>  sEval b
-  And a b        -> sEval a &&& sEval b
-  Or a b         -> sEval a ||| sEval b
   Not a          -> bnot (sEval a)
+
+  BinOp op a b -> case op of
+    And -> sEval a &&& sEval b
+    Or  -> sEval a ||| sEval b
+    Add -> sEval a +   sEval b
+
   LitB a         -> literal a
   LitI a         -> literal a
   Sym a          -> a
@@ -219,19 +257,27 @@ sEval = \case
 data Motive a where
   MLength   :: Expr 'IntTy              -> Motive a
   MAt       :: Expr 'IntTy -> Expr a    -> Motive a
-  MNegate   :: Motive a                 -> Motive a
+  -- MNegate   :: Motive a                 -> Motive a
 
-  MAll      :: (Expr a -> Expr 'BoolTy) -> Motive a
-  MAny      :: (Expr a -> Expr 'BoolTy) -> Motive a
-  MSum      :: (Expr a -> Expr 'IntTy)
-            -> Expr 'IntTy              -> Motive a
-  -- MFold
+  -- MAll      :: (Expr a -> Expr 'BoolTy) -> Motive a
+  -- MAny      :: (Expr a -> Expr 'BoolTy) -> Motive a
+  MFold
+    -- consuming a list of a, where we operate on bs
+    :: SymWord (Concrete b) => (Expr a -> Expr b)
+    -- fold
+    -> Fold b
+    -- target
+    -> Expr b
+    -> Motive a
 
 evalMotive
   :: forall a. (Show (Concrete a), SymWord (Concrete a))
   => Motive a -> Expr ('List a) -> Symbolic (SBV Bool)
 evalMotive _ ListAt{} = error "nested lists not allowed"
 evalMotive _ Sym{}    = error "can't motivate evaluation of symbolic value"
+
+evalMotive MLength{} BinOp{} = error "vacuous match"
+evalMotive MAt{} BinOp{}     = error "vacuous match"
 
 evalMotive (MLength len) (ListCat a b) = do
   [al, bl] <- sIntegers ["al", "bl"]
@@ -248,59 +294,54 @@ evalMotive (MLength len) (ListInfo i) =
        _            -> error $
          "sorry, can't help with this motive: " ++ show i
 
-evalMotive (MAll f) (ListCat a b) = (&&&)
-  <$> evalMotive (MAll f) a
-  <*> evalMotive (MAll f) b
-evalMotive (MAll f) (ListMap g lst) = evalMotive (MAll (f . g)) lst
-evalMotive (MAll f) (ListInfo i) = case i of
-  AllInfo g -> do
-    j <- forall_
-    -- g is at least as strong an assumption as f.
-    -- example:
-    -- f: for all i: elements of the list, i > 0
-    -- g: i need to know that for all i: elements of the list, i > -1
-    let fEval = sEval $ f $ Sym j
-        gEval = sEval $ g $ Sym j
-    pure $ gEval ==> fEval
-  LenInfo len
-    | Just 0 <- unliteral len -> pure true
-    | otherwise -> error "TODO"
-  LitList l -> pure $ foldr (&&&) true (fmap (sEval . f . Sym) l)
-  _ -> error $ "sorry, can't help with this motive: " ++ show i
-
-evalMotive (MAny f) (ListCat a b) = (|||)
-  <$> evalMotive (MAny f) a
-  <*> evalMotive (MAny f) b
-evalMotive (MAny f) (ListMap g lst) = evalMotive (MAny (f . g)) lst
-evalMotive (MAny f) (ListInfo info) = case info of
-  AnyInfo g -> do
-    j <- exists_
-    let fEval = sEval $ f $ Sym j
-        gEval = sEval $ g $ Sym j
-    pure $ gEval ==> fEval
-  LenInfo len
-    | Just 0 <- unliteral len -> pure false
-    | otherwise -> error "TODO"
-  LitList l -> pure $ foldr (|||) false (fmap (sEval . f . Sym) l)
-  _ -> error $ "sorry, can't help with this motive: " ++ show info
-
-evalMotive (MSum f target) (ListCat a b) = do
-  [targetA, targetB] <- sIntegers ["targetA", "targetB"]
-  let sV = sEval target
-  constrain $ sV .== targetA + targetB
+evalMotive (MFold mapping fold target) (ListCat a b) = do
+  [targetA, targetB] <- mkExistVars 2 -- sIntegers ["targetA", "targetB"]
+  let append = BinOp fold
+  constrain $ sEval target .== sEval (Sym targetA `append` Sym targetB)
   (&&&)
-    <$> evalMotive (MSum f (Sym targetA)) a
-    <*> evalMotive (MSum f (Sym targetB)) b
-evalMotive (MSum f target) (ListInfo info) = case info of
-  SumInfo i -> do
-    pure $ sEval (f i) .== sEval target
-  LenInfo len
+    <$> evalMotive (MFold mapping fold (Sym targetA)) a
+    <*> evalMotive (MFold mapping fold (Sym targetB)) b
+
+evalMotive (MFold f And target) (ListInfo (FoldInfo g And i)) = do
+  -- g is at least as strong an assumption as f.
+  -- example:
+  -- f: for all i: elements of the list, i > 0
+  -- g: i need to know that for all i: elements of the list, i > -1
+  j <- forall_
+  let fEval = sEval $ f (Sym j) `Eq` target
+      gEval = sEval $ g (Sym j) `Eq` i
+  pure $ gEval ==> fEval
+
+evalMotive (MFold f Or target) (ListInfo (FoldInfo g Or i)) = do
+  j <- exists_
+  let fEval = sEval $ f (Sym j) `Eq` target
+      gEval = sEval $ g (Sym j) `Eq` i
+  pure $ gEval ==> fEval
+
+evalMotive (MFold f Add target) (ListInfo (FoldInfo g Add i)) = do
+  j <- forall_
+  let fEval = sEval $ f (Sym j) `Eq` target
+      gEval = sEval $ g (Sym j) `Eq` i
+  pure $ gEval ==> fEval
+
+evalMotive (MFold mapping fold target) (ListInfo info) = case (fold, info) of
+  (_, LenInfo len)
     | Just cLen <- unliteral len -> do
       vars <- mkExistVars (fromIntegral cLen)
-      pure $ sum (fmap (sEval . f . Sym) vars) .== sEval target
+      pure $
+        sEval (foldr (BinOp fold) (empty fold) (fmap (mapping . Sym) vars))
+        .==
+        sEval target
+    | otherwise -> error "TODO: folding non-literal length list"
+  (_, LitList l) -> pure $
+    sEval target
+    .==
+    sEval (foldr (BinOp fold) (empty fold) (fmap (mapping . Sym) l))
   _ -> error $ "sorry, can't help with this motive: " ++ show info
-evalMotive (MSum f target) (ListMap g lst) =
-  evalMotive (MSum (f . g) target) lst
+evalMotive (MFold mapping fold target) (ListMap g lst) =
+  evalMotive (MFold (mapping . g) fold target) lst
+
+evalMotive MFold{} _ = error "sorry, can't help with this motive"
 
 evalMotive (MAt i a) (ListCat l1 l2) = do
     let l1' = sEval l1
@@ -320,119 +361,119 @@ evalMotive (MAt i a) (ListInfo info) = case info of
 
   _ -> error "can't help with this motive"
 
-evalMotive (MNegate (MAll f)) lst    = evalMotive (MAny (Not . f)) lst
-evalMotive (MNegate (MAny f)) lst    = evalMotive (MAll (Not . f)) lst
-evalMotive (MNegate MLength{}) _lst  = error "TODO"
-evalMotive (MNegate MAt{}) _lst      = error "TODO"
-evalMotive (MNegate (MNegate m)) lst = evalMotive m lst
-evalMotive (MNegate MSum{}) _lst     = error "TODO"
-
-l0 :: Expr 'IntTy
-l0 = LitI 0
+empty :: Fold a -> Expr a
+empty = \case
+  Add -> 0
+  And -> true
+  Or  -> false
 
 gt0 :: Expr 'IntTy -> Expr 'BoolTy
-gt0 x = Gt x l0
+gt0 x = Gt x 0
 
 lte0 :: Expr 'IntTy -> Expr 'BoolTy
-lte0 x = Not (Gt x l0)
+lte0 x = Not (Gt x 0)
 
 main :: IO ()
 main = do
   makeReport "any (> 0) [1, 2, 3] (expect good)" $ do
     let lst = ListInfo (LitList [1, 2, 3])
-    constrain =<< evalMotive (MAny gt0) lst
+    constrain =<< evalMotive (MFold gt0 Or true) lst
 
   makeReport "any (> 0) [-1, 2, 3] (expect good)" $ do
     let lst = ListInfo (LitList [-1, 2, 3])
-    constrain =<< evalMotive (MAny gt0) lst
+    constrain =<< evalMotive (MFold gt0 Or true) lst
 
   makeReport "any (> 0) [a, -1, 3] (expect good)" $ do
     a <- sInteger "a"
     let lst = ListInfo (LitList [a, -1, 3])
-    constrain =<< evalMotive (MAny gt0) lst
+    constrain =<< evalMotive (MFold gt0 Or true) lst
 
   makeReport "all (> 0) [a, -1, 3] (expect bad)" $ do
     a <- sInteger "a"
     let lst = ListInfo (LitList [a, -1, 3])
-    constrain =<< evalMotive (MAll gt0) lst
+    constrain =<< evalMotive (MFold gt0 And true) lst
 
   makeReport "length [] == 0 (expect good)" $ do
     let lst = ListInfo (LenInfo 0) :: Expr ('List 'IntTy)
-    constrain =<< evalMotive (MLength l0) lst
+    constrain =<< evalMotive (MLength 0) lst
 
   makeReport "length (len 2) == 2 (expect good)" $ do
     let lst :: Expr ('List 'IntTy)
         lst = ListInfo (LenInfo 2)
-    constrain =<< evalMotive (MLength (LitI 2)) lst
+    constrain =<< evalMotive (MLength 2) lst
 
   -- show that the result of a mapping is all positive
   makeReport "fmap (> 0) lst == true (expect good)" $ do
     let lst = ListInfo (AllInfo gt0) :: Expr ('List 'IntTy)
-    constrain =<< evalMotive (MAll gt0) lst
+    constrain =<< evalMotive (MFold gt0 And true) lst
 
   let almostAllPos :: Expr ('List 'IntTy)
       almostAllPos = ListCat
         (ListInfo (AllInfo gt0))
         (ListCat
-          (ListInfo (AllInfo (Eq l0)))
+          (ListInfo (AllInfo (Eq 0)))
           (ListInfo (AllInfo gt0)))
 
   makeReport "fmap (> 0) almostAllPos == true (expect bad)" $ do
-    constrain =<< evalMotive (MAll gt0) almostAllPos
+    constrain =<< evalMotive (MFold gt0 And true) almostAllPos
 
   makeReport "(and []) == true (expect good)" $
-    constrain <=< evalMotive (MAll (Eq true')) $ ListInfo $ LenInfo 0
+    constrain =<< evalMotive (MFold (Eq @'BoolTy true) And true) (ListInfo (LenInfo 0))
 
   makeReport "(not (and [])) == true (expect bad)" $ do
-    x <- evalMotive (MAll (Eq true')) $ ListInfo $ LenInfo 0
+    x <- evalMotive (MFold (Eq @'BoolTy true) And true) (ListInfo (LenInfo 0))
     constrain $ bnot x
 
   let mkAnd :: SBV Bool -> ListInfo 'BoolTy
       mkAnd = AllInfo . Eq . Sym
 
   makeReport "(and [true]) == true (expect good)" $
-    constrain <=< evalMotive (MAll (Eq true')) $ ListInfo $ mkAnd true -- AndInfo $ SAnd true
+    constrain <=< evalMotive (MFold (Eq true) And true) $ ListInfo $ mkAnd true -- AndInfo $ SAnd true
       -- Lit [true]
 
   makeReport "(and [false]) == true (expect bad)" $
-    constrain <=< evalMotive (MAll (Eq true')) $ ListInfo $ mkAnd false -- AndInfo $ SAnd false
+    constrain =<< evalMotive
+      (MFold (Eq true) And true)
+      (ListInfo $ FoldInfo id And false)
       -- Lit [false]
 
   makeReport "and [false] /= true (expect good)" $ do
-    constrain <=< evalMotive (MAll (Eq true')) $
-      ListInfo $ mkAnd false -- AndInfo $ SAnd false
-      -- Lit [false]
+    constrain =<< evalMotive
+      (MFold (Eq true) And false)
+      (ListInfo (FoldInfo id And false))
 
   makeReport "not (any (> 0) (all [> 0])) == false (expect bad)" $ do
-    constrain <=< evalMotive (MNegate (MAny gt0)) $ ListInfo $ AllInfo gt0
+    constrain =<< evalMotive
+      (MFold gt0 And false)
+      (ListInfo (AllInfo gt0))
 
   makeReport "not (all (> 0) (any [<= 0])) == true (expect good)" $ do
-    constrain <=< evalMotive (MNegate (MAll gt0)) $ ListInfo $ AnyInfo lte0
+    constrain =<< evalMotive
+      (MFold gt0 Or false)
+      (ListInfo $ AnyInfo lte0)
 
   makeReport "at 2 [1, 2, 3] == 3 (expect good)" $ do
-    constrain <=< evalMotive (MAt (LitI 2) (LitI 3)) $ ListInfo $ LitList
-      [1, 2, 3]
+    constrain =<< evalMotive
+      (MAt (LitI 2) (LitI 3))
+      (ListInfo $ LitList [1, 2, 3])
 
   makeReport "at 2 [1, 2, 3] == 2 (expect bad)" $ do
-    constrain <=< evalMotive (MAt (LitI 2) (LitI 2)) $ ListInfo $ LitList
-      [1, 2, 3]
+    constrain =<< evalMotive
+      (MAt (LitI 2) (LitI 2))
+      (ListInfo $ LitList [1, 2, 3])
 
   let sumTo7 :: Expr ('List 'IntTy)
       sumTo7 = ListCat
-        (ListInfo (SumInfo (LitI 3)))
-        (ListInfo (SumInfo (LitI 4)))
+        (ListInfo (FoldInfo id Add 3))
+        (ListInfo (FoldInfo id Add 4))
 
   makeReport "sum sumTo7 == 7 (expect good)" $ do
-    constrain =<< evalMotive (MSum id (LitI 7)) sumTo7
+    constrain =<< evalMotive (MFold id Add 7) sumTo7
 
   makeReport "sum (map (const 1) [length 7]) == 7 (expect good)" $ do
     let lst :: Expr ('List 'IntTy)
         lst = ListInfo (LenInfo 7)
-    constrain =<< evalMotive (MSum (const (LitI 1)) (LitI 7)) lst
-
-true', false' :: Expr 'BoolTy
-true'  = LitB true
-false' = LitB false
+    constrain =<< evalMotive (MFold (const 1) Add 7) lst
 
 makeReport :: String -> Symbolic () -> IO ()
 makeReport header a = do
