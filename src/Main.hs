@@ -65,7 +65,6 @@ instance Boolean (Expr 'BoolTy) where
   false = LitB False
   bnot  = Not
   (&&&) = BinOp And
-  (|||) = BinOp Or
 
 instance Num (Expr 'IntTy) where
   fromInteger = LitI
@@ -78,7 +77,6 @@ instance Num (Expr 'IntTy) where
 
 data Fold a where
   And :: Fold 'BoolTy
-  Or  :: Fold 'BoolTy
   Add :: Fold 'IntTy
 
 deriving instance Show (Fold a)
@@ -89,10 +87,6 @@ data ListInfo a where
   FoldInfo     :: (Expr a -> Expr b) -> Fold b -> Expr b -> ListInfo a
   AtInfo       :: Expr 'IntTy -> Expr a                  -> ListInfo a
   ContainsInfo :: Expr a                                 -> ListInfo a
-
-pattern AnyInfo :: (b ~ 'BoolTy) => (Expr a -> Expr b) -> ListInfo a
-pattern AnyInfo f <- FoldInfo f Or  (LitB False) where
-  AnyInfo f = FoldInfo f Or  (LitB False)
 
 pattern AllInfo :: (b ~ 'BoolTy) => (Expr a -> Expr b) -> ListInfo a
 pattern AllInfo f <- FoldInfo f And (LitB True) where
@@ -174,7 +168,6 @@ eval = \case
 
   BinOp op a b -> case op of
     And -> eval a && eval b
-    Or  -> eval a || eval b
     Add -> eval a +  eval b
 
   LitB a             -> a
@@ -193,7 +186,6 @@ sEval = \case
 
   BinOp op a b -> case op of
     And -> sEval a &&& sEval b
-    Or  -> sEval a ||| sEval b
     Add -> sEval a +   sEval b
 
   LitB a         -> literal a
@@ -255,12 +247,6 @@ evalMotive (MFold f And target) (ListInfo (FoldInfo g And i)) = do
       gEval = sEval $ g (Sym j) `Eq` i
   pure $ gEval ==> fEval
 
-evalMotive (MFold f Or target) (ListInfo (FoldInfo g Or i)) = do
-  j <- exists_
-  let fEval = sEval $ f (Sym j) `Eq` target
-      gEval = sEval $ g (Sym j) `Eq` i
-  pure $ gEval ==> fEval
-
 evalMotive (MFold f Add target) (ListInfo (FoldInfo g Add i)) = do
   j <- forall_
   let fEval = sEval $ f (Sym j) `Eq` target
@@ -311,7 +297,6 @@ empty :: Fold a -> Expr a
 empty = \case
   Add -> 0
   And -> true
-  Or  -> false
 
 gt0 :: Expr 'IntTy -> Expr 'BoolTy
 gt0 x = Gt x 0
@@ -319,20 +304,23 @@ gt0 x = Gt x 0
 lte0 :: Expr 'IntTy -> Expr 'BoolTy
 lte0 x = Not (Gt x 0)
 
+mkAnyM :: (Expr a -> Expr 'BoolTy) -> Motive a
+mkAnyM f = MFold (bnot . f) And false
+
 main :: IO ()
 main = do
   makeReport "any (> 0) [1, 2, 3] (expect good)" $ do
     let lst = ListInfo (LitList [1, 2, 3])
-    constrain =<< evalMotive (MFold gt0 Or true) lst
+    constrain =<< evalMotive (mkAnyM gt0) lst
 
   makeReport "any (> 0) [-1, 2, 3] (expect good)" $ do
     let lst = ListInfo (LitList [-1, 2, 3])
-    constrain =<< evalMotive (MFold gt0 Or true) lst
+    constrain =<< evalMotive (mkAnyM gt0) lst
 
   makeReport "any (> 0) [a, -1, 3] (expect good)" $ do
     a <- sInteger "a"
     let lst = ListInfo (LitList [a, -1, 3])
-    constrain =<< evalMotive (MFold gt0 Or true) lst
+    constrain =<< evalMotive (mkAnyM gt0) lst
 
   makeReport "all (> 0) [a, -1, 3] (expect bad)" $ do
     a <- sInteger "a"
@@ -360,7 +348,7 @@ main = do
           (ListInfo (AllInfo (Eq 0)))
           (ListInfo (AllInfo gt0)))
 
-  makeReport "fmap (> 0) almostAllPos == true (expect bad)" $ do
+  makeReport "fmap (> 0) almostAllPos == true (expect bad)" $
     constrain =<< evalMotive (MFold gt0 And true) almostAllPos
 
   makeReport "(and []) == true (expect good)" $
@@ -375,7 +363,6 @@ main = do
 
   makeReport "(and [true]) == true (expect good)" $
     constrain <=< evalMotive (MFold (Eq true) And true) $ ListInfo $ mkAnd true -- AndInfo $ SAnd true
-      -- Lit [true]
 
   makeReport "(and [false]) == true (expect bad)" $
     constrain =<< evalMotive
@@ -383,27 +370,29 @@ main = do
       (ListInfo $ FoldInfo id And false)
       -- Lit [false]
 
-  makeReport "and [false] /= true (expect good)" $ do
+  makeReport "and [false] /= true (expect good)" $
     constrain =<< evalMotive
       (MFold (Eq true) And false)
       (ListInfo (FoldInfo id And false))
 
-  makeReport "not (any (> 0) (all [> 0])) == false (expect bad)" $ do
+  makeReport "all (> 0) => (not (any (> 0)) == false) (expect bad)" $
     constrain =<< evalMotive
       (MFold gt0 And false)
       (ListInfo (AllInfo gt0))
 
-  makeReport "not (all (> 0) (any [<= 0])) == true (expect good)" $ do
+  makeReport "any (<= 0) => not (all (> 0)) (expect good)" $
     constrain =<< evalMotive
-      (MFold gt0 Or false)
-      (ListInfo $ AnyInfo lte0)
+      (MFold gt0 And false)
+      -- (ListInfo (FoldInfo lte0 Or true))
+      -- <=>
+      (ListInfo (FoldInfo (bnot . lte0) And false))
 
-  makeReport "at 2 [1, 2, 3] == 3 (expect good)" $ do
+  makeReport "at 2 [1, 2, 3] == 3 (expect good)" $
     constrain =<< evalMotive
       (MAt (LitI 2) (LitI 3))
       (ListInfo $ LitList [1, 2, 3])
 
-  makeReport "at 2 [1, 2, 3] == 2 (expect bad)" $ do
+  makeReport "at 2 [1, 2, 3] == 2 (expect bad)" $
     constrain =<< evalMotive
       (MAt (LitI 2) (LitI 2))
       (ListInfo $ LitList [1, 2, 3])
@@ -413,7 +402,7 @@ main = do
         (ListInfo (FoldInfo id Add 3))
         (ListInfo (FoldInfo id Add 4))
 
-  makeReport "sum sumTo7 == 7 (expect good)" $ do
+  makeReport "sum sumTo7 == 7 (expect good)" $
     constrain =<< evalMotive (MFold id Add 7) sumTo7
 
   makeReport "sum (map (const 1) [length 7]) == 7 (expect good)" $ do
