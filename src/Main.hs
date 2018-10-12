@@ -81,6 +81,11 @@ data Fold a where
 
 deriving instance Show (Fold a)
 
+empty :: Fold a -> Expr a
+empty = \case
+  Add -> 0
+  And -> true
+
 data ListInfo a where
   LitList      :: [SBV (Concrete a)]                     -> ListInfo a
   LenInfo      :: SBV Integer                            -> ListInfo a
@@ -209,8 +214,11 @@ data Motive a where
     -> Expr b
     -> Motive a
 
+forAll' :: (SymWord (Concrete a), Provable t) => (Expr a -> t) -> Predicate
+forAll' f = forAll_ $ f . Sym
+
 evalMotive
-  :: forall a. (Show (Concrete a), SymWord (Concrete a))
+  :: forall a. Suitable a
   => Motive a -> Expr ('List a) -> Symbolic (SBV Bool)
 evalMotive _ Sym{}    = error "can't motivate evaluation of symbolic value"
 
@@ -237,21 +245,20 @@ evalMotive (MFold mapping fold target) (ListCat a b) = do
     <$> evalMotive (MFold mapping fold (Sym targetA)) a
     <*> evalMotive (MFold mapping fold (Sym targetB)) b
 
-evalMotive (MFold f And target) (ListInfo (FoldInfo g And i)) = do
-  -- g is at least as strong an assumption as f.
-  -- example:
-  -- f: for all i: elements of the list, i > 0
-  -- g: i need to know that for all i: elements of the list, i > -1
-  j <- forall_
-  let fEval = sEval $ f (Sym j) `Eq` target
-      gEval = sEval $ g (Sym j) `Eq` i
-  pure $ gEval ==> fEval
-
-evalMotive (MFold f Add target) (ListInfo (FoldInfo g Add i)) = do
-  j <- forall_
-  let fEval = sEval $ f (Sym j) `Eq` target
-      gEval = sEval $ g (Sym j) `Eq` i
-  pure $ gEval ==> fEval
+-- g is at least as strong an assumption as f.
+-- example:
+-- f: for all i: elements of the list, i > 0
+-- g: i need to know that for all i: elements of the list, i > -1
+evalMotive (MFold f And target) (ListInfo (FoldInfo g And lst))
+  = forAll' $ \j ->
+    sEval (f j `Eq` target)
+    ==>
+    sEval (g j `Eq` lst)
+evalMotive (MFold f Add target) (ListInfo (FoldInfo g Add lst))
+  = forAll' $ \j ->
+    sEval (f j `Eq` target)
+    ==>
+    sEval (g j `Eq` lst)
 
 evalMotive (MFold mapping fold target) (ListInfo info) = case (fold, info) of
   (_, LenInfo len)
@@ -292,11 +299,6 @@ evalMotive (MAt i a) (ListInfo info) = case info of
 
 evalMotive MLength{} BinOp{} = error "vacuous match"
 evalMotive MAt{} BinOp{}     = error "vacuous match"
-
-empty :: Fold a -> Expr a
-empty = \case
-  Add -> 0
-  And -> true
 
 gt0 :: Expr 'IntTy -> Expr 'BoolTy
 gt0 x = Gt x 0
