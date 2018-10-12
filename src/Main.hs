@@ -86,9 +86,26 @@ empty = \case
   Add -> 0
   And -> true
 
+-- "My claim is that we should exploit a hypothesis not in terms of its
+-- immediate consequences, but in terms of the leverage it exerts on an
+-- arbitrary goal: we should give elimination a motive"
+
+-- The motive for consuming a list of type @a@
+data Motive a where
+  MLength   :: Expr 'IntTy           -> Motive a
+  MAt       :: Expr 'IntTy -> Expr a -> Motive a
+  MFold
+    -- consuming a list of a, where we operate on bs
+    :: SymWord (Concrete b) => (Expr a -> Expr b)
+    -- fold
+    -> Fold b
+    -- target
+    -> Expr b
+    -> Motive a
+
 data ListInfo a where
   LitList      :: [SBV (Concrete a)]                     -> ListInfo a
-  LenInfo      :: SBV Integer                            -> ListInfo a
+  LenInfo      :: Expr 'IntTy                            -> ListInfo a
   FoldInfo     :: (Expr a -> Expr b) -> Fold b -> Expr b -> ListInfo a
   AtInfo       :: Expr 'IntTy -> Expr a                  -> ListInfo a
   ContainsInfo :: Expr a                                 -> ListInfo a
@@ -197,30 +214,13 @@ sEval = \case
   LitI a         -> literal a
   Sym a          -> a
 
--- "My claim is that we should exploit a hypothesis not in terms of its
--- immediate consequences, but in terms of the leverage it exerts on an
--- arbitrary goal: we should give elimination a motive"
-
--- The motive for consuming a list of type @a@
-data Motive a where
-  MLength   :: Expr 'IntTy           -> Motive a
-  MAt       :: Expr 'IntTy -> Expr a -> Motive a
-  MFold
-    -- consuming a list of a, where we operate on bs
-    :: SymWord (Concrete b) => (Expr a -> Expr b)
-    -- fold
-    -> Fold b
-    -- target
-    -> Expr b
-    -> Motive a
-
 forAll' :: (SymWord (Concrete a), Provable t) => (Expr a -> t) -> Predicate
 forAll' f = forAll_ $ f . Sym
 
 evalMotive
   :: forall a. Suitable a
   => Motive a -> Expr ('List a) -> Symbolic (SBV Bool)
-evalMotive _ Sym{}    = error "can't motivate evaluation of symbolic value"
+evalMotive _ Sym{} = error "can't motivate evaluation of symbolic value"
 
 evalMotive (MLength len) (ListCat a b) = do
   [al, bl] <- sIntegers ["al", "bl"]
@@ -232,7 +232,7 @@ evalMotive (MLength len) (ListMap _ lst) = evalMotive (MLength len) lst
 evalMotive (MLength len) (ListInfo i) =
   let lenV = sEval len
   in case i of
-       LenInfo len' -> pure $ len'                    .== lenV
+       LenInfo len' -> pure $ sEval len'              .== lenV
        LitList l    -> pure $ fromIntegral (length l) .== lenV
        _            -> error $
          "sorry, can't help with this motive: " ++ show i
@@ -262,7 +262,7 @@ evalMotive (MFold f Add target) (ListInfo (FoldInfo g Add lst))
 
 evalMotive (MFold mapping fold target) (ListInfo info) = case (fold, info) of
   (_, LenInfo len)
-    | Just cLen <- unliteral len -> do
+    | Just cLen <- unliteral (sEval len) -> do
       vars <- mkExistVars (fromIntegral cLen)
       pure $
         sEval (foldr (BinOp fold) (empty fold) (fmap (mapping . Sym) vars))
