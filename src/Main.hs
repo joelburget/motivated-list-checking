@@ -216,6 +216,9 @@ evalMotive
   => ListInfo a -> Expr ('List a) -> Symbolic (SBV Bool)
 evalMotive _ Sym{} = error "can't motivate evaluation of symbolic value"
 
+evalMotive (LitList l1) l2'@(ListMap f l2) = pure $
+  SBVL.implode l1 .== sEval l2'
+
 evalMotive (LenInfo len) (ListCat a b) = do
   [al, bl] <- sIntegers ["al", "bl"]
   let totalLen = al + bl .== sEval len
@@ -292,7 +295,7 @@ evalMotive (AtInfo i a) (ListInfo info) = case info of
   _ -> error "can't help with this motive"
 
 evalMotive LenInfo{} BinOp{} = error "vacuous match"
-evalMotive AtInfo{} BinOp{}     = error "vacuous match"
+evalMotive AtInfo{}  BinOp{} = error "vacuous match"
 
 gt0 :: Expr 'IntTy -> Expr 'BoolTy
 gt0 x = Gt x 0
@@ -343,7 +346,7 @@ main = do
           a <- sInteger "a"
           pure $ ListInfo $ LitList [a, -1, 3]
 
-    , scope "all (> 0) [a, -1, 3] (expect bad)" $
+    , scope "all (> 0) [a, -1, 3]" $
       mkTest Invalid (FoldInfo gt0 And true) $ do
         a <- sInteger "a"
         pure $ ListInfo $ LitList [a, -1, 3]
