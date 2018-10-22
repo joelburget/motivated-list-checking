@@ -32,10 +32,10 @@ data Ty
   | IntTy
   | BoolTy
 
-type family Concrete (ty :: Ty) :: *
-type instance Concrete ('List a) = [Concrete a]
-type instance Concrete 'IntTy    = Integer
-type instance Concrete 'BoolTy   = Bool
+type family Concrete (ty :: Ty) where
+  Concrete ('List a) = [Concrete a]
+  Concrete 'IntTy    = Integer
+  Concrete 'BoolTy   = Bool
 
 type Suitable a = (Show (Concrete a), SymWord (Concrete a), Literal a)
 
