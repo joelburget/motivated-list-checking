@@ -32,12 +32,23 @@ data Ty
   | IntTy
   | BoolTy
 
+data SingTy :: Ty -> * where
+  SList :: SingTy a -> SingTy ('List a)
+  SInt  ::             SingTy 'IntTy
+  SBool ::             SingTy 'BoolTy
+
 type family Concrete (ty :: Ty) where
   Concrete ('List a) = [Concrete a]
   Concrete 'IntTy    = Integer
   Concrete 'BoolTy   = Bool
 
 type Suitable a = (Show (Concrete a), SymWord (Concrete a), Literal a)
+
+data Existential where
+  Exists :: SingTy ty -> Expr ty -> Existential
+
+example :: Existential
+example = Exists (SList SInt) (ListInfo (LitList [1, 2, 3]))
 
 data Expr ty where
   -- transducers
