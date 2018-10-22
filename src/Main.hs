@@ -24,25 +24,31 @@ import           Data.SBV
 import           Data.SBV.List ((.++))
 -- import qualified Data.SBV.List as SBVL
 import           EasyTest
-import           Prelude       as P hiding (concat)
+import           Prelude       as P hiding (concat, init)
+import Data.List (find)
 
 
 data Ty
   = List Ty
   | IntTy
   | BoolTy
+  deriving Show
 
 data SingTy :: Ty -> * where
   SList :: SingTy a -> SingTy ('List a)
   SInt  ::             SingTy 'IntTy
   SBool ::             SingTy 'BoolTy
 
+instance Show (SingTy ty) where
+  showsPrec p = \case
+    SList a -> showParen (p > 10) $ showString "SList " . showsPrec 11 a
+    SInt    -> showString "SInt"
+    SBool   -> showString "SBool"
+
 type family Concrete (ty :: Ty) where
   Concrete ('List a) = [Concrete a]
   Concrete 'IntTy    = Integer
   Concrete 'BoolTy   = Bool
-
-type Suitable a = (Show (Concrete a), SymWord (Concrete a), Literal a)
 
 data Existential where
   Exists :: SingTy ty -> Expr ty -> Existential
@@ -50,31 +56,72 @@ data Existential where
 example :: Existential
 example = Exists (SList SInt) (ListInfo (LitList [1, 2, 3]))
 
-data Expr ty where
+class Sing ty where
+  sing :: SingTy ty
+
+instance Sing 'BoolTy where
+  sing = SBool
+
+instance Sing 'IntTy where
+  sing = SInt
+
+instance Sing a => Sing ('List a) where
+  sing = SList sing
+
+data Expr (ty :: Ty) where
   -- transducers
-  ListCat  :: Suitable a
-           => Expr ('List a) -> Expr ('List a) -> Expr ('List a)
-  ListMap  :: Suitable a
-           => (Expr a -> Expr b)
+  ListCat
+    :: SymWord (Concrete a)
+    => Expr ('List a) -> Expr ('List a) -> Expr ('List a)
+  ListMap  :: SingTy a -> (Expr a -> Expr b)
            ->                   Expr ('List a) -> Expr ('List b)
 
   ListLen :: Expr ('List a) -> Expr 'IntTy
-  ListFold :: Suitable a
-    => (Expr a -> Expr b) -> Fold b -> Expr ('List a) -> Expr b
+  ListFold :: SingTy a -> (Expr a -> Expr b) -> Fold b -> Expr ('List a) -> Expr b
   ListAt :: Expr 'IntTy -> Expr ('List a) -> Expr a
-  ListContains :: Suitable a => Expr a -> Expr ('List a) -> Expr 'BoolTy
+  ListContains :: SingTy a -> Expr a -> Expr ('List a) -> Expr 'BoolTy
 
   -- other
-  Eq       :: (Eq (Concrete a), Suitable a)
-           => Expr a         -> Expr a         -> Expr 'BoolTy
+  Eq
+    :: SymWord (Concrete a)
+    => SingTy a -> Expr a         -> Expr a         -> Expr 'BoolTy
   Gt       :: Expr 'IntTy    -> Expr 'IntTy    -> Expr 'BoolTy
   Not      ::                   Expr 'BoolTy   -> Expr 'BoolTy
   BinOp    :: Fold a -> Expr a -> Expr a -> Expr a
 
   LitB     :: Concrete 'BoolTy                 -> Expr 'BoolTy
   LitI     :: Concrete 'IntTy                  -> Expr 'IntTy
-  ListInfo :: Suitable a => ListInfo a                       -> Expr ('List a)
-  Sym      :: SBV (Concrete a)                 -> Expr a
+
+  SymB :: SBV Bool    -> Expr 'BoolTy
+  SymI :: SBV Integer -> Expr 'IntTy
+
+  ListInfo :: ListInfo a                       -> Expr ('List a)
+
+symOf :: SingTy ty -> SBV (Concrete ty) -> Expr ty
+symOf (SList _) _ = error "we don't support symbolic lists"
+symOf SInt  s     = SymI s
+symOf SBool s     = SymB s
+
+litOf :: SingTy ty -> Concrete ty -> Expr ty
+litOf (SList ty) l = ListInfo $ LitList $ litOf ty <$> l
+litOf SInt       i = LitI i
+litOf SBool      b = LitB b
+
+varOf :: SingTy ty -> String -> Expr ty
+varOf (SList _) _ = error "we don't support list variables"
+varOf SInt      v = symOf SInt  (uninterpret v)
+varOf SBool     v = symOf SBool (uninterpret v)
+
+eqOf :: SingTy ty -> Concrete ty -> Concrete ty -> Bool
+eqOf (SList ty) a b = length a == length b && and (zipWith (eqOf ty) a b)
+eqOf SInt       a b = a == b
+eqOf SBool      a b = a == b
+
+lit :: Sing ty => Concrete ty -> Expr ty
+lit = litOf sing
+
+sym :: Sing ty => SBV (Concrete ty) -> Expr ty
+sym = symOf sing
 
 instance Boolean (Expr 'BoolTy) where
   true  = LitB True
@@ -116,12 +163,14 @@ sFoldOp = \case
 -- immediate consequences, but in terms of the leverage it exerts on an
 -- arbitrary goal: we should give elimination a motive"
 
-data ListInfo a where
+data ListInfo (ty :: Ty) where
   LitList      :: [Expr a]                     -> ListInfo a
   LenInfo      :: Expr 'IntTy                            -> ListInfo a
-  FoldInfo     :: SymWord (Concrete b)
+  FoldInfo
+    :: SingTy a
+    -> SingTy b
     -- consuming a list of a, where we operate on bs
-    => (Expr a -> Expr b)
+    -> (Expr a -> Expr b)
     -- fold
     -> Fold b
     -- result
@@ -129,18 +178,22 @@ data ListInfo a where
     -> ListInfo a
   AtInfo       :: Expr 'IntTy -> Expr a                  -> ListInfo a
   ContainsInfo :: Expr a                                 -> ListInfo a
-  MapInfo :: (Expr a -> Expr b) -> Expr b -> ListInfo a
+  MapInfo :: SingTy a -> SingTy b  -> (Expr a -> Expr b) -> Expr b -> ListInfo a
 
-pattern AllInfo :: (b ~ 'BoolTy) => (Expr a -> Expr b) -> ListInfo a
-pattern AllInfo f = FoldInfo f And (LitB True)
+allInfo :: (Sing a, b ~ 'BoolTy) => (Expr a -> Expr b) -> ListInfo a
+allInfo f = FoldInfo sing SBool f And (LitB True)
 
-instance HasKind (Concrete a) => Show (ListInfo a) where
+instance Show (ListInfo ty) where
   showsPrec p li = showParen (p > 10) $ case li of
     LitList l -> showString "LitList " . showsPrec 11 l
     LenInfo i -> showString "LenInfo " . showsPrec 11 i
-    FoldInfo f fold empty' ->
+    FoldInfo a b f fold empty' ->
         showString "FoldInfo "
-      . showsPrec 11 (f (Sym (uninterpret "x")))
+      . showsPrec 11 a
+      . showString " "
+      . showsPrec 11 b
+      . showString " "
+      . showsPrec 11 (f (varOf a "x"))
       . showString " "
       . showsPrec 11 fold
       . showString " "
@@ -151,9 +204,13 @@ instance HasKind (Concrete a) => Show (ListInfo a) where
       . showString " "
       . showsPrec 11 a
     ContainsInfo a -> showString "ContainsInfo " . showsPrec 11 a
-    MapInfo f bs ->
+    MapInfo a b f bs ->
         showString "MapInfo "
-      . showsPrec 11 (f (Sym (uninterpret "x")))
+      . showsPrec 11 a
+      . showString " "
+      . showsPrec 11 b
+      . showString " "
+      . showsPrec 11 (f (varOf a "x"))
       . showString " "
       . showsPrec 11 bs
 
@@ -164,17 +221,21 @@ instance Show (Expr ty) where
       . showsPrec 11 a
       . showString " "
       . showsPrec 11 b
-    ListMap f as ->
+    ListMap a f as ->
         showString "ListMap "
-      . showsPrec 11 (f (Sym (uninterpret "x")))
+      . showsPrec 11 a
+      . showString " "
+      . showsPrec 11 (f (varOf a "x"))
       . showString " "
       . showsPrec 11 as
     ListLen as ->
         showString "ListLen "
       . showsPrec 11 as
-    ListFold f fempty as ->
+    ListFold a f fempty as ->
         showString "ListFold "
-      . showsPrec 11 (f (Sym (uninterpret "x")))
+      . showsPrec 11 a
+      . showString " "
+      . showsPrec 11 (f (varOf a "x"))
       . showString " "
       . showsPrec 11 fempty
       . showString " "
@@ -184,8 +245,10 @@ instance Show (Expr ty) where
       . showsPrec 11 i
       . showString " "
       . showsPrec 11 a
-    ListContains a as ->
+    ListContains tyA a as ->
         showString "ListAt "
+      . showsPrec 11 tyA
+      . showString " "
       . showsPrec 11 a
       . showString " "
       . showsPrec 11 as
@@ -194,8 +257,10 @@ instance Show (Expr ty) where
     LitI a     -> showString "LitI "     . showsPrec 11 a
     ListInfo i -> showString "ListInfo " . showsPrec 11 i
 
-    Eq a b ->
+    Eq ty a b ->
         showString "Eq "
+      . showsPrec 11 ty
+      . showString " "
       . showsPrec 11 a
       . showString " "
       . showsPrec 11 b
@@ -212,31 +277,26 @@ instance Show (Expr ty) where
       . showString " "
       . showsPrec 11 b
     Not a -> showString "Not " . showsPrec 11 a
-    Sym a -> showsPrec 11 a
 
-class Literal a where
-  lit :: Concrete a -> Expr a
-
-instance Literal 'BoolTy where
-  lit = LitB
-
-instance Literal 'IntTy where
-  lit = LitI
+    SymB a -> showsPrec 11 a
+    SymI a -> showsPrec 11 a
 
 eval :: Expr ty -> Concrete ty
 eval = \case
   ListCat a b        -> eval a <> eval b
-  ListMap f as       -> eval . f . lit <$> eval as
+  ListMap a f as     -> eval . f . litOf a <$> eval as
   ListLen l          -> fromIntegral $ length $ eval l
-  ListFold f fold l  -> foldr
+  ListFold a f fold l  -> foldr
     (foldOp fold)
     (eval (empty fold))
-    (fmap (eval . f . lit) (eval l))
+    (fmap (eval . f . litOf a) (eval l))
   ListAt i l         -> eval l !! fromIntegral (eval i)
-  ListContains a as  -> eval a `elem` eval as
-  Eq a b             -> eval a == eval b
-  Gt a b             -> eval a >  eval b
-  Not a              -> not (eval a)
+  ListContains ty a as -> case find (eqOf ty (eval a)) (eval as) of
+    Just _  -> True
+    Nothing -> False
+  Eq ty a b -> eqOf ty (eval a) (eval b)
+  Gt a b    -> eval a > eval b
+  Not a     -> not (eval a)
 
   BinOp op a b       -> foldOp op (eval a) (eval b)
 
@@ -245,18 +305,20 @@ eval = \case
   ListInfo i -> case i of
     LitList l -> fmap eval l
     _         -> error "can't evaluate non-literal list"
-  Sym _              -> error "canot evaluate symbolic value"
+
+  SymB _ -> error "canot evaluate symbolic value"
+  SymI _ -> error "canot evaluate symbolic value"
 
 sEval
   :: SymWord (Concrete ty)
   => Expr ty -> ExceptT String Symbolic (SBV (Concrete ty))
 sEval = \case
-  ListCat a b    -> (.++) <$> sEval a <*> sEval b
-  ListMap{}      -> throwError "can't map with sbv lists"
+  ListCat a b -> (.++) <$> sEval a <*> sEval b
+  ListMap{}   -> throwError "can't map with sbv lists"
 
   ListLen (ListInfo (LenInfo len)) -> sEval len
 
-  ListFold f fold (ListInfo (LitList l)) ->  do
+  ListFold _a f fold (ListInfo (LitList l)) ->  do
     init  <- sEval (empty fold)
     elems <- traverse (sEval . f) l
     foldrM
@@ -264,7 +326,7 @@ sEval = \case
       init
       elems
 
-  ListFold f fold (ListInfo (FoldInfo g fold' empty')) -> do
+  ListFold _ f fold (ListInfo (FoldInfo _a _b g fold' empty')) -> do
     init  <- sEval (empty fold)
     -- lift $ constrain $
 
@@ -286,20 +348,21 @@ sEval = \case
 
   -- ListContains a as  -> eval a `elem` eval as
 
-  Eq a b         -> (.==) <$> sEval a <*> sEval b
-  Gt a b         -> (.>)  <$> sEval a <*> sEval b
-  Not a          -> bnot  <$> sEval a
+  Eq ty a b -> (.==) <$> sEval a <*> sEval b
+  Gt a b    -> (.>)  <$> sEval a <*> sEval b
+  Not a     -> bnot  <$> sEval a
 
   BinOp op a b -> case op of
     And -> (&&&) <$> sEval a <*> sEval b
     Add -> (+)   <$> sEval a <*> sEval b
 
-  LitB a         -> pure $ literal a
-  LitI a         -> pure $ literal a
-  Sym a          -> pure $ a
+  LitB a -> pure $ literal a
+  LitI a -> pure $ literal a
+  SymB a -> pure $ a
+  SymI a -> pure $ a
 
-forAll' :: (SymWord (Concrete a), Provable t) => (Expr a -> t) -> Predicate
-forAll' f = forAll_ $ f . Sym
+-- forAll' :: (SymWord (Concrete a), Provable t) => (Expr a -> t) -> Predicate
+-- forAll' f = forAll_ $ f . sym
 
 -- evalMotive
 --   :: forall a. Suitable a
@@ -406,56 +469,57 @@ mkTest expectValid expr = do
 data Validity = Valid | Invalid
   deriving Eq
 
-mkAny
-  :: Suitable a => (Expr a -> Expr 'BoolTy) -> ListInfo a -> Expr 'BoolTy
-mkAny f = ListFold (bnot . f) And . ListInfo
+mkAny :: SingTy a -> (Expr a -> Expr 'BoolTy) -> ListInfo a -> Expr 'BoolTy
+mkAny a f = ListFold a (bnot . f) And . ListInfo
 
-mkAll
-  :: Suitable a => (Expr a -> Expr 'BoolTy) -> ListInfo a -> Expr 'BoolTy
-mkAll f = ListFold f And . ListInfo
+mkAll :: SingTy a -> (Expr a -> Expr 'BoolTy) -> ListInfo a -> Expr 'BoolTy
+mkAll a f = ListFold a f And . ListInfo
 
 main :: IO ()
 main = do
   let almostAllPos :: Expr ('List 'IntTy)
       almostAllPos = ListCat
-        (ListInfo (AllInfo gt0))
+        (ListInfo (allInfo gt0))
         (ListCat
-          (ListInfo (AllInfo (Eq 0)))
-          (ListInfo (AllInfo gt0)))
+          (ListInfo (allInfo (Eq SInt 0)))
+          (ListInfo (allInfo gt0)))
 
       sumTo7 :: Expr ('List 'IntTy)
       sumTo7 = ListCat
-        (ListInfo (FoldInfo id Add 3))
-        (ListInfo (FoldInfo id Add 4))
+        (ListInfo (FoldInfo SInt SInt id Add 3))
+        (ListInfo (FoldInfo SInt SInt id Add 4))
 
   run $ tests
     [ scope "any (> 0) [1, 2, 3]" $
-        mkTest Valid $ pure $ mkAny gt0 $ LitList [1, 2, 3]
+        mkTest Valid $ pure $ mkAny SInt gt0 $ LitList [1, 2, 3]
 
     , scope "any (> 0) [-1, 2, 3]" $
-        mkTest Valid $ pure $ mkAny gt0 $ LitList [lit (-1), 2, 3]
+        mkTest Valid $ pure $ mkAny SInt gt0 $ LitList [lit (-1), 2, 3]
 
     , scope "any (> 0) [a, -1, 3]" $ do
         mkTest Valid $ do
           a <- sInteger "a"
-          pure $ mkAny gt0 $ LitList [Sym a, lit (-1), 3]
+          pure $ mkAny SInt gt0 $ LitList [sym a, lit (-1), 3]
 
     , scope "all (> 0) [a, -1, 3]" $
       mkTest Invalid  $ do
         a <- sInteger "a"
-        pure $ mkAll gt0 $ LitList [Sym a, lit (-1), 3]
+        pure $ mkAll SInt gt0 $ LitList [sym a, lit (-1), 3]
 
     , scope "length [] == 0" $ do
-        mkTest Valid $ pure $ ListLen (ListInfo @'IntTy (LenInfo 0)) `Eq` 0
+        let eq = Eq SInt
+        mkTest Valid $ pure $ ListLen (ListInfo @'IntTy (LenInfo 0)) `eq` 0
 
     , scope "length (len 2) == 2" $ do
-        mkTest Valid $ pure $ ListLen (ListInfo @'IntTy (LenInfo 2)) `Eq` 2
+        let eq = Eq SInt
+        mkTest Valid $ pure $ ListLen (ListInfo @'IntTy (LenInfo 2)) `eq` 2
 
       -- show that the result of a mapping is all positive
-    , scope "fmap (> 0) lst == true" $
-        -- let lst = ListInfo (AllInfo gt0) :: Expr ('List 'IntTy)
+    , scope "fmap (> 0) lst == true" $ do
+        -- let lst = ListInfo (allInfo gt0) :: Expr ('List 'IntTy)
+        let eq = Eq SBool
         mkTest Valid $ pure $
-          ListFold gt0 And (ListInfo (FoldInfo gt0 And true)) `Eq` true
+          ListFold SInt gt0 And (ListInfo (FoldInfo SInt SBool gt0 And true)) `eq` true
 
     -- , scope "fmap (> 0) almostAllPos == true" $
     --     mkTest Invalid (FoldInfo gt0 And true) $ pure almostAllPos
@@ -470,7 +534,7 @@ main = do
 
     -- , scope "(and [true]) == true" $
     --     mkTest @'BoolTy Valid (FoldInfo (Eq true) And true)
-    --       $ pure $ ListInfo $ AllInfo $ Eq $ Sym true
+    --       $ pure $ ListInfo $ allInfo $ Eq $ sym true
 
     -- , scope "(and [false]) == true" $
     --     mkTest Invalid
@@ -485,20 +549,22 @@ main = do
     -- , scope "all (> 0) => (not (any (> 0)) == false)" $
     --     mkTest Invalid
     --       (FoldInfo gt0 And false)
-    --       $ pure $ ListInfo $ AllInfo gt0
+    --       $ pure $ ListInfo $ allInfo gt0
 
     -- , scope "any (<= 0) => not (all (> 0))" $
     --     mkTest Valid
     --       (FoldInfo gt0 And false)
     --       $ pure $ ListInfo $ FoldInfo (bnot . lte0) And false
 
-    , scope "at 2 [1, 2, 3] == 3" $
+    , scope "at 2 [1, 2, 3] == 3" $ do
+        let eq = Eq SInt
         mkTest Valid $ pure $
-          ListAt (LitI 2) (ListInfo (LitList [1, 2, 3])) `Eq` LitI 3
+          ListAt (LitI 2) (ListInfo (LitList [1, 2, 3])) `eq` LitI 3
 
-    , scope "at 2 [1, 2, 3] == 2" $
+    , scope "at 2 [1, 2, 3] == 2" $ do
+        let eq = Eq SInt
         mkTest Invalid $ pure $
-          ListAt (LitI 2) (ListInfo (LitList [1, 2, 3])) `Eq` LitI 2
+          ListAt (LitI 2) (ListInfo (LitList [1, 2, 3])) `eq` LitI 2
 
     -- , scope "sum sumTo7 == 7" $
     --     mkTest Valid (FoldInfo id Add 7) $ pure sumTo7
