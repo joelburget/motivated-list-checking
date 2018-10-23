@@ -25,6 +25,7 @@ import           Data.SBV.List ((.++))
 import           EasyTest
 import           Prelude       as P hiding (concat, init)
 import Data.List (find)
+import           Data.Type.Equality           ((:~:) (Refl), apply)
 
 
 data Ty
@@ -37,6 +38,11 @@ data SingTy :: Ty -> * where
   SList :: SingTy a -> SingTy ('List a)
   SInt  ::             SingTy 'IntTy
   SBool ::             SingTy 'BoolTy
+
+singEq :: SingTy a -> SingTy b -> Maybe (a :~: b)
+singEq (SList a) (SList b) = apply Refl <$> singEq a b
+singEq SInt      SInt      = Just Refl
+singEq SBool     SBool     = Just Refl
 
 instance Show (SingTy ty) where
   showsPrec p = \case
@@ -111,6 +117,9 @@ eqOf (SList ty) a b = length a == length b && and (zipWith (eqOf ty) a b)
 eqOf SInt       a b = a == b
 eqOf SBool      a b = a == b
 
+forAllOf :: Provable t => SingTy ty -> (Expr ty -> t) -> Predicate
+forAllOf = undefined
+
 lit :: Sing ty => Concrete ty -> Expr ty
 lit = litOf sing
 
@@ -183,7 +192,7 @@ instance Show (ListInfo ty) where
   showsPrec p li = showParen (p > 10) $ case li of
     LitList l -> showString "LitList " . showsPrec 11 l
     LenInfo i -> showString "LenInfo " . showsPrec 11 i
-    FoldInfo a b f fold empty' ->
+    FoldInfo a b f fold result ->
         showString "FoldInfo "
       . showsPrec 11 a
       . showString " "
@@ -193,7 +202,7 @@ instance Show (ListInfo ty) where
       . showString " "
       . showsPrec 11 fold
       . showString " "
-      . showsPrec 11 empty'
+      . showsPrec 11 result
     AtInfo i a ->
         showString "AtInfo "
       . showsPrec 11 i
@@ -307,6 +316,9 @@ eval = \case
   SymB _ -> error "canot evaluate symbolic value"
   SymI _ -> error "canot evaluate symbolic value"
 
+forceRight :: Either a b -> b
+forceRight (Left _) = error "unexpected left"
+forceRight (Right b) = b
 
 sEval
   :: Expr ty -> ExceptT String Symbolic (SBV (Concrete ty))
@@ -326,11 +338,35 @@ sEval = \case
       init
       elems
 
-  ListFold _ f fold (ListInfo (FoldInfo _a _b g fold' empty')) -> do
-    init  <- sEval (empty fold)
-    -- lift $ constrain $
+  ListFold a1 f And (ListInfo (FoldInfo a2 _b g And result)) ->
+    case singEq a1 a2 of
+      Nothing   -> throwError "can't compare folds of different types"
+      Just Refl -> do
+        -- init <- sEval (empty And)
 
-    undefined
+        -- lift $ forAllOf a1 $ \i ->
+        --   fmap forceRight (runExceptT (sEval (f i `eq` sym init)))
+        --   ==>
+        --   fmap forceRight (runExceptT (sEval (g i `eq` result)))
+
+        sEval result
+
+  ListFold a1 f Add (ListInfo (FoldInfo a2 _b g Add result)) ->
+    case singEq a1 a2 of
+      Nothing   -> throwError "can't compare folds of different types"
+      -- XXX: f and g must be equal
+      Just Refl -> sEval result
+
+  ListFold a f fold (ListCat _ l1 l2) -> sFoldOp fold
+    <$> sEval (ListFold a f fold l1)
+    <*> sEval (ListFold a f fold l2)
+
+  ListFold _ _ fold (ListInfo (LenInfo len)) -> do
+    len' <- sEval len
+    case unliteral len' of
+      Just 0  -> sEval $ empty fold
+      Just _  -> throwError "can't determine fold of this list"
+      Nothing -> throwError "can't determine fold of this list"
 
   ListAt i (ListInfo (AtInfo j v)) -> do
     i' <- sEval i
@@ -565,7 +601,7 @@ main = do
 
     , scope "all (> 0) => (not (any (> 0)) == false)" $
         mkTest Invalid $ pure $
-          mkAll gt0 $ allInfo gt0
+          bnot $ mkAny gt0 $ allInfo gt0
 
     , scope "any (<= 0) => not (all (> 0))" $
         mkTest Valid $ pure $
