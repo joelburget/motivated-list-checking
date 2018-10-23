@@ -117,8 +117,10 @@ eqOf (SList ty) a b = length a == length b && and (zipWith (eqOf ty) a b)
 eqOf SInt       a b = a == b
 eqOf SBool      a b = a == b
 
-forAllOf :: Provable t => SingTy ty -> (Expr ty -> t) -> Predicate
-forAllOf = undefined
+forAllOf :: SingTy ty -> (Expr ty -> Symbolic (SBV Bool)) -> Predicate
+forAllOf SInt f      = forAll_ $ f . sym
+forAllOf SBool f     = forAll_ $ f . sym
+forAllOf (SList _) _ = error "i don't know what to do in this case"
 
 lit :: Sing ty => Concrete ty -> Expr ty
 lit = litOf sing
@@ -320,8 +322,12 @@ forceRight :: Either a b -> b
 forceRight (Left _) = error "unexpected left"
 forceRight (Right b) = b
 
-sEval
-  :: Expr ty -> ExceptT String Symbolic (SBV (Concrete ty))
+sEval' :: Expr ty -> Symbolic (SBV (Concrete ty))
+sEval' x = forceRight <$> runExceptT (sEval x)
+
+type Eval ty = ExceptT String Symbolic (SBV (Concrete ty))
+
+sEval :: Expr ty -> Eval ty
 sEval = \case
   ListCat SBool a b     -> (.++) <$> sEval a <*> sEval b
   ListCat SInt  a b     -> (.++) <$> sEval a <*> sEval b
@@ -338,24 +344,38 @@ sEval = \case
       init
       elems
 
-  ListFold a1 f And (ListInfo (FoldInfo a2 _b g And result)) ->
+  ListFold a1 f And (ListInfo (FoldInfo a2 b g And result)) ->
     case singEq a1 a2 of
       Nothing   -> throwError "can't compare folds of different types"
       Just Refl -> do
-        -- init <- sEval (empty And)
+        init <- sEval (empty And)
 
-        -- lift $ forAllOf a1 $ \i ->
-        --   fmap forceRight (runExceptT (sEval (f i `eq` sym init)))
-        --   ==>
-        --   fmap forceRight (runExceptT (sEval (g i `eq` result)))
+        -- show that our knowledge is at least as strong as the assumption
+        -- TODO: this may not be quite right
+        precondition <- lift $ forAllOf a1 $ \someA ->
+          forAllOf b $ \someB -> do
+            knowledge  <- sEval' $ f someA -- `eq` someB -- sym init
+            assumption <- sEval' $ g someA -- `eq` someB -- result
+            pure $ knowledge ==> assumption
+        lift $ constrain precondition
 
         sEval result
 
   ListFold a1 f Add (ListInfo (FoldInfo a2 _b g Add result)) ->
     case singEq a1 a2 of
       Nothing   -> throwError "can't compare folds of different types"
-      -- XXX: f and g must be equal
-      Just Refl -> sEval result
+      Just Refl -> do
+        init <- sEval (empty Add)
+
+        -- show that our knowledge is at least as strong as the assumption
+        -- TODO: this is not quite right
+        precondition <- lift $ forAllOf a1 $ \i -> do
+          knowledge  <- sEval' $ f i `eq` sym init
+          assumption <- sEval' $ g i `eq` result
+          pure $ knowledge ==> assumption
+        lift $ constrain precondition
+
+        sEval result
 
   ListFold a f fold (ListCat _ l1 l2) -> sFoldOp fold
     <$> sEval (ListFold a f fold l1)
