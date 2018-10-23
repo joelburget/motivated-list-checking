@@ -22,7 +22,6 @@ import Data.Foldable (foldrM)
 import Control.Monad.Except
 import           Data.SBV
 import           Data.SBV.List ((.++))
--- import qualified Data.SBV.List as SBVL
 import           EasyTest
 import           Prelude       as P hiding (concat, init)
 import Data.List (find)
@@ -70,9 +69,7 @@ instance Sing a => Sing ('List a) where
 
 data Expr (ty :: Ty) where
   -- transducers
-  ListCat
-    :: SymWord (Concrete a)
-    => Expr ('List a) -> Expr ('List a) -> Expr ('List a)
+  ListCat :: SingTy a -> Expr ('List a) -> Expr ('List a) -> Expr ('List a)
   ListMap  :: SingTy a -> (Expr a -> Expr b)
            ->                   Expr ('List a) -> Expr ('List b)
 
@@ -82,9 +79,7 @@ data Expr (ty :: Ty) where
   ListContains :: SingTy a -> Expr a -> Expr ('List a) -> Expr 'BoolTy
 
   -- other
-  Eq
-    :: SymWord (Concrete a)
-    => SingTy a -> Expr a         -> Expr a         -> Expr 'BoolTy
+  Eq :: SingTy a -> Expr a         -> Expr a    -> Expr 'BoolTy
   Gt       :: Expr 'IntTy    -> Expr 'IntTy    -> Expr 'BoolTy
   Not      ::                   Expr 'BoolTy   -> Expr 'BoolTy
   BinOp    :: Fold a -> Expr a -> Expr a -> Expr a
@@ -216,8 +211,10 @@ instance Show (ListInfo ty) where
 
 instance Show (Expr ty) where
   showsPrec p expr = showParen (p > 10) $ case expr of
-    ListCat a b ->
+    ListCat ty a b ->
       showString "ListCat "
+      . showsPrec 11 ty
+      . showString " "
       . showsPrec 11 a
       . showString " "
       . showsPrec 11 b
@@ -283,7 +280,7 @@ instance Show (Expr ty) where
 
 eval :: Expr ty -> Concrete ty
 eval = \case
-  ListCat a b        -> eval a <> eval b
+  ListCat _ a b      -> eval a <> eval b
   ListMap a f as     -> eval . f . litOf a <$> eval as
   ListLen l          -> fromIntegral $ length $ eval l
   ListFold a f fold l  -> foldr
@@ -309,12 +306,14 @@ eval = \case
   SymB _ -> error "canot evaluate symbolic value"
   SymI _ -> error "canot evaluate symbolic value"
 
+
 sEval
-  :: SymWord (Concrete ty)
-  => Expr ty -> ExceptT String Symbolic (SBV (Concrete ty))
+  :: Expr ty -> ExceptT String Symbolic (SBV (Concrete ty))
 sEval = \case
-  ListCat a b -> (.++) <$> sEval a <*> sEval b
-  ListMap{}   -> throwError "can't map with sbv lists"
+  ListCat SBool a b     -> (.++) <$> sEval a <*> sEval b
+  ListCat SInt  a b     -> (.++) <$> sEval a <*> sEval b
+  ListCat (SList _) a b -> throwError "nested lists not allowed"
+  ListMap{}             -> throwError "can't map with sbv lists"
 
   ListLen (ListInfo (LenInfo len)) -> sEval len
 
@@ -478,14 +477,14 @@ mkAll a f = ListFold a f And . ListInfo
 main :: IO ()
 main = do
   let almostAllPos :: Expr ('List 'IntTy)
-      almostAllPos = ListCat
+      almostAllPos = ListCat SInt
         (ListInfo (allInfo gt0))
-        (ListCat
+        (ListCat SInt
           (ListInfo (allInfo (Eq SInt 0)))
           (ListInfo (allInfo gt0)))
 
       sumTo7 :: Expr ('List 'IntTy)
-      sumTo7 = ListCat
+      sumTo7 = ListCat SInt
         (ListInfo (FoldInfo SInt SInt id Add 3))
         (ListInfo (FoldInfo SInt SInt id Add 4))
 
