@@ -489,6 +489,9 @@ main = do
         (ListInfo (FoldInfo SInt SInt id Add 3))
         (ListInfo (FoldInfo SInt SInt id Add 4))
 
+      eqb = Eq SBool
+      eqi = Eq SInt
+
   run $ tests
     [ scope "any (> 0) [1, 2, 3]" $
         mkTest Valid $ pure $ mkAny SInt gt0 $ LitList [1, 2, 3]
@@ -506,71 +509,74 @@ main = do
         a <- sInteger "a"
         pure $ mkAll SInt gt0 $ LitList [sym a, lit (-1), 3]
 
-    , scope "length [] == 0" $ do
-        let eq = Eq SInt
-        mkTest Valid $ pure $ ListLen (ListInfo @'IntTy (LenInfo 0)) `eq` 0
+    , scope "length [] == 0" $
+        mkTest Valid $ pure $ ListLen (ListInfo @'IntTy (LenInfo 0)) `eqi` 0
 
-    , scope "length (len 2) == 2" $ do
-        let eq = Eq SInt
-        mkTest Valid $ pure $ ListLen (ListInfo @'IntTy (LenInfo 2)) `eq` 2
+    , scope "length (len 2) == 2" $
+        mkTest Valid $ pure $ ListLen (ListInfo @'IntTy (LenInfo 2)) `eqi` 2
 
       -- show that the result of a mapping is all positive
-    , scope "fmap (> 0) lst == true" $ do
+    , scope "fmap (> 0) lst == true" $
         -- let lst = ListInfo (allInfo gt0) :: Expr ('List 'IntTy)
-        let eq = Eq SBool
         mkTest Valid $ pure $
-          ListFold SInt gt0 And (ListInfo (FoldInfo SInt SBool gt0 And true)) `eq` true
+          ListFold SInt gt0 And (ListInfo (FoldInfo SInt SBool gt0 And true))
 
-    -- , scope "fmap (> 0) almostAllPos == true" $
-    --     mkTest Invalid (FoldInfo gt0 And true) $ pure almostAllPos
-
-    -- , scope "(and []) == true" $
-    --     mkTest Valid (FoldInfo (Eq @'BoolTy true) And true)
-    --       $ pure $ ListInfo $ LenInfo 0
-
-    -- , scope "all (eq true) [] /= false" $ do
-    --     mkTest Invalid (FoldInfo (Eq @'BoolTy true) And false)
-    --       $ pure $ ListInfo $ LenInfo 0
-
-    -- , scope "(and [true]) == true" $
-    --     mkTest @'BoolTy Valid (FoldInfo (Eq true) And true)
-    --       $ pure $ ListInfo $ allInfo $ Eq $ sym true
-
-    -- , scope "(and [false]) == true" $
-    --     mkTest Invalid
-    --       (FoldInfo (Eq true) And true)
-    --       $ pure $ ListInfo $ FoldInfo id And false
-
-    -- , scope "and [false] /= true" $
-    --     mkTest Valid
-    --       (FoldInfo (Eq true) And false)
-    --       $ pure $ ListInfo $ FoldInfo id And false
-
-    -- , scope "all (> 0) => (not (any (> 0)) == false)" $
-    --     mkTest Invalid
-    --       (FoldInfo gt0 And false)
-    --       $ pure $ ListInfo $ allInfo gt0
-
-    -- , scope "any (<= 0) => not (all (> 0))" $
-    --     mkTest Valid
-    --       (FoldInfo gt0 And false)
-    --       $ pure $ ListInfo $ FoldInfo (bnot . lte0) And false
-
-    , scope "at 2 [1, 2, 3] == 3" $ do
-        let eq = Eq SInt
-        mkTest Valid $ pure $
-          ListAt (LitI 2) (ListInfo (LitList [1, 2, 3])) `eq` LitI 3
-
-    , scope "at 2 [1, 2, 3] == 2" $ do
-        let eq = Eq SInt
+    , scope "fmap (> 0) almostAllPos == true" $
         mkTest Invalid $ pure $
-          ListAt (LitI 2) (ListInfo (LitList [1, 2, 3])) `eq` LitI 2
+          ListFold SInt gt0 And almostAllPos
 
-    -- , scope "sum sumTo7 == 7" $
-    --     mkTest Valid (FoldInfo id Add 7) $ pure sumTo7
+    , scope "(and []) == true" $
+        mkTest Valid $ pure $
+          ListFold SBool id And (ListInfo (LenInfo 0))
 
-    -- , scope "sum (map (const 1) [length 7]) == 7" $ do
-    --     let lst :: Expr ('List 'IntTy)
-    --         lst = ListInfo (LenInfo 7)
-    --     mkTest Valid (FoldInfo (const 1) Add 7) $ pure lst
+    , scope "all (eq true) [] /= false" $ do
+        mkTest Invalid $ pure $ Not $
+          ListFold SBool id And (ListInfo (LenInfo 0))
+
+    , scope "(and [true]) == true" $
+        mkTest Valid $ pure $
+          ListFold SBool (Eq SBool true) And
+            (ListInfo $ allInfo $ Eq SBool $ sym true)
+
+    , scope "(and [false]) == true" $
+        mkTest Invalid $ pure $
+          ListFold SBool (Eq SBool true) And
+            (ListInfo $ FoldInfo SBool SBool id And false)
+
+    , scope "and [false] /= true" $
+        mkTest Valid $ pure $
+          ListFold SBool (Eq SBool true) And
+            (ListInfo $ FoldInfo SBool SBool id And false)
+
+    , scope "all (> 0) => (not (any (> 0)) == false)" $
+        mkTest Invalid $ pure $
+          ListFold SInt gt0 And
+            (ListInfo $ allInfo gt0)
+
+    , scope "any (<= 0) => not (all (> 0))" $
+        mkTest Valid $ pure $
+          ListFold SInt gt0 And
+            (ListInfo $ FoldInfo SInt SBool (bnot . lte0) And false)
+
+    , scope "at 2 [1, 2, 3] == 3" $
+        mkTest Valid $ pure $
+          ListAt (LitI 2) (ListInfo (LitList [1, 2, 3])) `eqi` LitI 3
+
+    , scope "at 2 [1, 2, 3] == 2" $
+        mkTest Invalid $ pure $
+          ListAt (LitI 2) (ListInfo (LitList [1, 2, 3])) `eqi` LitI 2
+
+    , scope "sum sumTo7 == 7" $
+        mkTest Valid $ pure $
+          (ListFold SInt id Add) sumTo7
+          `eqi`
+          7
+
+    , scope "sum (map (const 1) [length 7]) == 7" $ do
+        let lst :: Expr ('List 'IntTy)
+            lst = ListInfo (LenInfo 7)
+        mkTest Valid $ pure $
+          (ListFold SInt (const 1) Add) lst
+          `eqi`
+          7
     ]
