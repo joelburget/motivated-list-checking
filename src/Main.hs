@@ -69,28 +69,27 @@ instance Sing a => Sing ('List a) where
 
 data Expr (ty :: Ty) where
   -- transducers
-  ListCat :: SingTy a -> Expr ('List a) -> Expr ('List a) -> Expr ('List a)
-  ListMap  :: SingTy a -> (Expr a -> Expr b)
-           ->                   Expr ('List a) -> Expr ('List b)
+  ListCat      :: SingTy a -> Expr ('List a)     -> Expr ('List a) -> Expr ('List a)
+  ListMap      :: SingTy a -> (Expr a -> Expr b) -> Expr ('List a) -> Expr ('List b)
 
-  ListLen :: Expr ('List a) -> Expr 'IntTy
-  ListFold :: SingTy a -> (Expr a -> Expr b) -> Fold b -> Expr ('List a) -> Expr b
-  ListAt :: Expr 'IntTy -> Expr ('List a) -> Expr a
-  ListContains :: SingTy a -> Expr a -> Expr ('List a) -> Expr 'BoolTy
+  ListLen      ::                                             Expr ('List a) -> Expr 'IntTy
+  ListFold     :: SingTy a -> (Expr a -> Expr b) -> Fold b -> Expr ('List a) -> Expr b
+  ListAt       ::                              Expr 'IntTy -> Expr ('List a) -> Expr a
+  ListContains ::                       SingTy a -> Expr a -> Expr ('List a) -> Expr 'BoolTy
 
   -- other
-  Eq :: SingTy a -> Expr a         -> Expr a    -> Expr 'BoolTy
-  Gt       :: Expr 'IntTy    -> Expr 'IntTy    -> Expr 'BoolTy
-  Not      ::                   Expr 'BoolTy   -> Expr 'BoolTy
-  BinOp    :: Fold a -> Expr a -> Expr a -> Expr a
+  Eq           :: SingTy a -> Expr a -> Expr a -> Expr 'BoolTy
+  Gt           ::  Expr 'IntTy -> Expr 'IntTy  -> Expr 'BoolTy
+  Not          ::                 Expr 'BoolTy -> Expr 'BoolTy
+  BinOp        ::   Fold a -> Expr a -> Expr a -> Expr a
 
-  LitB     :: Concrete 'BoolTy                 -> Expr 'BoolTy
-  LitI     :: Concrete 'IntTy                  -> Expr 'IntTy
+  LitB         :: Concrete 'BoolTy -> Expr 'BoolTy
+  LitI         :: Concrete 'IntTy  -> Expr 'IntTy
 
-  SymB :: SBV Bool    -> Expr 'BoolTy
-  SymI :: SBV Integer -> Expr 'IntTy
+  SymB         :: SBV Bool    -> Expr 'BoolTy
+  SymI         :: SBV Integer -> Expr 'IntTy
 
-  ListInfo :: ListInfo a                       -> Expr ('List a)
+  ListInfo     :: ListInfo a -> Expr ('List a)
 
 symOf :: SingTy ty -> SBV (Concrete ty) -> Expr ty
 symOf (SList _) _ = error "we don't support symbolic lists"
@@ -159,8 +158,8 @@ sFoldOp = \case
 -- arbitrary goal: we should give elimination a motive"
 
 data ListInfo (ty :: Ty) where
-  LitList      :: [Expr a]                     -> ListInfo a
-  LenInfo      :: Expr 'IntTy                            -> ListInfo a
+  LitList      :: [Expr a]    -> ListInfo a
+  LenInfo      :: Expr 'IntTy -> ListInfo a
   FoldInfo
     :: SingTy a
     -> SingTy b
@@ -171,9 +170,11 @@ data ListInfo (ty :: Ty) where
     -- result
     -> Expr b
     -> ListInfo a
-  AtInfo       :: Expr 'IntTy -> Expr a                  -> ListInfo a
-  ContainsInfo :: Expr a                                 -> ListInfo a
-  MapInfo :: SingTy a -> SingTy b  -> (Expr a -> Expr b) -> Expr b -> ListInfo a
+
+  AtInfo       :: Expr 'IntTy -> Expr a -> ListInfo a
+  ContainsInfo :: Expr a                -> ListInfo a
+
+  MapInfo :: SingTy a -> SingTy b -> (Expr a -> Expr b) -> Expr b -> ListInfo a
 
 allInfo :: (Sing a, b ~ 'BoolTy) => (Expr a -> Expr b) -> ListInfo a
 allInfo f = FoldInfo sing SBool f And (LitB True)
