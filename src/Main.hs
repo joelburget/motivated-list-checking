@@ -179,6 +179,9 @@ data ListInfo (ty :: Ty) where
 
   AtInfo       :: Expr 'IntTy -> Expr a -> ListInfo a
 
+  OrInfo  :: ListInfo a -> ListInfo a -> ListInfo a
+  AndInfo :: ListInfo a -> ListInfo a -> ListInfo a
+
 allInfo :: (Sing a, b ~ 'BoolTy) => (Expr a -> Expr b) -> ListInfo a
 allInfo f = FoldInfo sing SBool f And (LitB True)
 
@@ -201,6 +204,16 @@ instance Show (ListInfo ty) where
       . showsPrec 11 i
       . showString " "
       . showsPrec 11 a
+    OrInfo a b ->
+        showString "OrInfo "
+      . showsPrec 11 a
+      . showString " "
+      . showsPrec 11 b
+    AndInfo a b ->
+        showString "AndInfo "
+      . showsPrec 11 a
+      . showString " "
+      . showsPrec 11 b
 
 instance Show (Expr ty) where
   showsPrec p expr = showParen (p > 10) $ case expr of
