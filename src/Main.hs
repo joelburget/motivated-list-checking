@@ -170,7 +170,6 @@ sFoldOp = \case
 
 data ListInfo (ty :: Ty) where
   LitList      :: [Expr a]    -> ListInfo a
-  LenInfo      :: Expr 'IntTy -> ListInfo a
   FoldInfo
     :: SingTy a
     -> SingTy b
@@ -183,9 +182,6 @@ data ListInfo (ty :: Ty) where
     -> ListInfo a
 
   AtInfo       :: Expr 'IntTy -> Expr a -> ListInfo a
-  ContainsInfo :: Expr a                -> ListInfo a
-
-  MapInfo :: SingTy a -> SingTy b -> (Expr a -> Expr b) -> Expr b -> ListInfo a
 
 allInfo :: (Sing a, b ~ 'BoolTy) => (Expr a -> Expr b) -> ListInfo a
 allInfo f = FoldInfo sing SBool f And (LitB True)
@@ -193,7 +189,6 @@ allInfo f = FoldInfo sing SBool f And (LitB True)
 instance Show (ListInfo ty) where
   showsPrec p li = showParen (p > 10) $ case li of
     LitList l -> showString "LitList " . showsPrec 11 l
-    LenInfo i -> showString "LenInfo " . showsPrec 11 i
     FoldInfo a b f fold result ->
         showString "FoldInfo "
       . showsPrec 11 a
@@ -210,16 +205,6 @@ instance Show (ListInfo ty) where
       . showsPrec 11 i
       . showString " "
       . showsPrec 11 a
-    ContainsInfo a -> showString "ContainsInfo " . showsPrec 11 a
-    MapInfo a b f bs ->
-        showString "MapInfo "
-      . showsPrec 11 a
-      . showString " "
-      . showsPrec 11 b
-      . showString " "
-      . showsPrec 11 (f (varOf a "x"))
-      . showString " "
-      . showsPrec 11 bs
 
 instance Show (Expr ty) where
   showsPrec p expr = showParen (p > 10) $ case expr of
@@ -334,7 +319,7 @@ sEval = \case
   ListCat (SList _) a b -> throwError "nested lists not allowed"
   ListMap{}             -> throwError "can't map with sbv lists"
 
-  ListLen (ListInfo (LenInfo len)) -> sEval len
+  ListLen (ListInfo (LitList l)) -> pure $ literal $ fromIntegral $ length l
 
   ListFold _a f fold (ListInfo (LitList l)) ->  do
     init  <- sEval (empty fold)
@@ -380,13 +365,6 @@ sEval = \case
   ListFold a f fold (ListCat _ l1 l2) -> sFoldOp fold
     <$> sEval (ListFold a f fold l1)
     <*> sEval (ListFold a f fold l2)
-
-  ListFold _ _ fold (ListInfo (LenInfo len)) -> do
-    len' <- sEval len
-    case unliteral len' of
-      Just 0  -> sEval $ empty fold
-      Just _  -> throwError "can't determine fold of this list"
-      Nothing -> throwError "can't determine fold of this list"
 
   ListAt i (ListInfo (AtInfo j v)) -> do
     i' <- sEval i
@@ -501,10 +479,14 @@ main = do
         pure $ mkAll gt0 $ LitList [sym a, lit (-1), 3]
 
     , scope "length [] == 0" $
-        mkTest Valid $ pure $ ListLen (ListInfo (LenInfo 0)) `eq` 0
+        mkTest Valid $ pure $ ListLen (ListInfo (LitList [])) `eq` 0
 
     , scope "length (len 2) == 2" $
-        mkTest Valid $ pure $ ListLen (ListInfo (LenInfo 2)) `eq` 2
+        mkTest Valid $ do
+          [a, b] <- sIntegers ["a", "b"]
+          let lst :: Expr ('List 'IntTy)
+              lst = ListInfo $ LitList [sym a, sym b]
+          pure $ ListLen lst `eq` 2
 
       -- show that the result of a mapping is all positive
     , scope "fmap (> 0) lst == true" $
@@ -517,11 +499,11 @@ main = do
 
     , scope "(and []) == true" $
         mkTest Valid $ pure $
-          mkAnd $ LenInfo 0
+          mkAnd $ LitList []
 
     , scope "all (eq true) [] /= false" $ do
         mkTest Invalid $ pure $ Not $
-          mkAnd $ LenInfo 0
+          mkAnd $ LitList []
 
     , scope "(and [true]) == true" $
         mkTest Valid $ pure $
@@ -557,11 +539,13 @@ main = do
           `eq`
           7
 
-    , scope "sum (map (const 1) [length 7]) == 7" $ do
-        let lst :: Expr ('List 'IntTy)
-            lst = ListInfo (LenInfo 7)
-        mkTest Valid $ pure $
-          mkFold (const 1) Add lst
-          `eq`
-          7
+    , scope "sum (map (const 1) [length 7]) == 7" $
+        mkTest Valid $ do
+          elems <- sIntegers ["a", "b", "c", "d", "e", "f", "g"]
+          let lst :: Expr ('List 'IntTy)
+              lst = ListInfo $ LitList $ sym <$> elems
+          pure $
+            mkFold (const 1) Add lst
+            `eq`
+            7
     ]
