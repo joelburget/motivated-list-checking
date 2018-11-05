@@ -164,10 +164,6 @@ sFoldOp = \case
   Add -> (+)
   And -> (&&&)
 
--- "My claim is that we should exploit a hypothesis not in terms of its
--- immediate consequences, but in terms of the leverage it exerts on an
--- arbitrary goal: we should give elimination a motive"
-
 data ListInfo (ty :: Ty) where
   LitList      :: [Expr a]    -> ListInfo a
   FoldInfo
