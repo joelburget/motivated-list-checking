@@ -27,14 +27,13 @@ import Data.Foldable (foldrM)
 import Control.Monad.Except
 import           Data.SBV
 import           Data.SBV.List ((.++))
-import           Data.SBV.Control hiding (io)
+-- import           Data.SBV.Control hiding (io)
 import           EasyTest
 import           Prelude       as P hiding (concat, init)
 import Data.List (find)
 import           Data.Type.Equality           ((:~:) (Refl), apply)
 import Data.Constraint (withDict, Dict(Dict))
 
-import Debug.Trace
 
 data Ty
   = List Ty
@@ -51,6 +50,7 @@ singEq :: SingTy a -> SingTy b -> Maybe (a :~: b)
 singEq (SList a) (SList b) = apply Refl <$> singEq a b
 singEq SInt      SInt      = Just Refl
 singEq SBool     SBool     = Just Refl
+singEq _         _         = Nothing
 
 instance Show (SingTy ty) where
   showsPrec p = \case
@@ -262,17 +262,6 @@ instance Show (Expr ty) where
     ListLen as ->
         showString "ListLen "
       . showsPrec 11 as
-    ListFold a b f fempty as ->
-        showString "ListFold "
-      . showsPrec 11 a
-      . showString " "
-      . showsPrec 11 b
-      . showString " "
-      . showsPrec 11 (f (symVarOf a "x"))
-      . showString " "
-      . showsPrec 11 fempty
-      . showString " "
-      . showsPrec 11 as
     ListAt i a ->
         showString "ListAt "
       . showsPrec 11 i
@@ -283,6 +272,17 @@ instance Show (Expr ty) where
       . showsPrec 11 tyA
       . showString " "
       . showsPrec 11 a
+      . showString " "
+      . showsPrec 11 as
+    ListFold a b f fempty as ->
+        showString "ListFold "
+      . showsPrec 11 a
+      . showString " "
+      . showsPrec 11 b
+      . showString " "
+      . showsPrec 11 (f (symVarOf a "x"))
+      . showString " "
+      . showsPrec 11 fempty
       . showString " "
       . showsPrec 11 as
 
@@ -314,6 +314,12 @@ instance Show (Expr ty) where
     SymB a -> showsPrec 11 a
     SymI a -> showsPrec 11 a
 
+    Var ty a ->
+        showString "Var "
+      . showsPrec 11 ty
+      . showString " "
+      . showsPrec 11 a
+
 eval :: Expr ty -> Concrete ty
 eval = \case
   ListCat _ a b      -> eval a <> eval b
@@ -339,8 +345,9 @@ eval = \case
     LitList l -> fmap eval l
     _         -> error "can't evaluate non-literal list"
 
-  SymB _ -> error "canot evaluate symbolic value"
-  SymI _ -> error "canot evaluate symbolic value"
+  SymB _  -> error "cannot evaluate symbolic value"
+  SymI _  -> error "cannot evaluate symbolic value"
+  Var _ _ -> error "cannot evaluate variable"
 
 forceRight :: Either a b -> b
 forceRight (Left _) = error "unexpected left"
@@ -357,7 +364,7 @@ sEval :: forall ty. Expr ty -> Eval ty
 sEval = \case
   ListCat SBool a b     -> (.++) <$> sEval a <*> sEval b
   ListCat SInt  a b     -> (.++) <$> sEval a <*> sEval b
-  ListCat (SList _) a b -> throwError "nested lists not allowed"
+  ListCat (SList _) _ _ -> throwError "nested lists not allowed"
   ListMap{}             -> throwError "can't map with sbv lists"
 
   ListLen (ListInfo (OrInfo a b)) -> do
@@ -396,12 +403,10 @@ sEval = \case
       init
       elems
 
-  ListFold a1 _b f And (ListInfo (FoldInfo a2 b g And result)) ->
+  ListFold a1 _b1 f And (ListInfo (FoldInfo a2 _b2 g And result)) ->
     case singEq a1 a2 of
       Nothing   -> throwError "can't compare folds of different types"
       Just Refl -> do
-        init <- sEval (empty And)
-
         -- show that our knowledge is at least as strong as the assumption
         -- TODO: this may not be quite right
         env <- ask
@@ -417,8 +422,6 @@ sEval = \case
     case singEq a1 a2 of
       Nothing   -> throwError "can't compare folds of different types"
       Just Refl -> do
-        init <- sEval (empty Add)
-
         -- The function we know about and the function we're asking about must
         -- be extensionally equal
         env <- ask
@@ -439,7 +442,11 @@ sEval = \case
     i' <- sEval i
     j' <- sEval j
     case (unliteral i', unliteral j') of
-      (Just i'', Just j'') -> if i'' == j'' then sEval v else throwError ""
+      (Just i'', Just j'') -> if i'' == j'' then sEval v else throwError $
+        -- TODO: we should recover from this failure
+        "mismatched at indices: " ++ show i'' ++ " vs " ++ show j''
+        -- TODO: we should recover from this failure as well
+      _ -> throwError "couldn't get literal form of both list indices"
 
   ListFold _ tyB _ _ (ListInfo (AtInfo _ _)) -> withSymWord tyB $ lift $ lift free_
 
@@ -450,12 +457,13 @@ sEval = \case
         if length l > fromIntegral i''
         then sEval $ l !! fromIntegral i''
         else throwError "indexing beyond the end of the list"
+      Nothing -> throwError "couldn't get literal list index"
 
   -- ListContains a as  -> eval a `elem` eval as
 
-  Eq ty a b -> (.==) <$> sEval a <*> sEval b
-  Gt a b    -> (.>)  <$> sEval a <*> sEval b
-  Not a     -> bnot  <$> sEval a
+  Eq _ty a b -> (.==) <$> sEval a <*> sEval b
+  Gt a b     -> (.>)  <$> sEval a <*> sEval b
+  Not a      -> bnot  <$> sEval a
 
   BinOp op a b -> case op of
     And -> (&&&) <$> sEval a <*> sEval b
@@ -465,6 +473,14 @@ sEval = \case
   LitI a -> pure $ literal a
   SymB a -> pure $ a
   SymI a -> pure $ a
+  Var ty1 a -> do
+    m <- ask
+    case Map.lookup a m of
+      Nothing -> throwError $ "couldn't find variable " ++ a
+      Just (Exists ty2 expr) -> case singEq ty1 ty2 of
+        Just Refl -> sEval expr
+        Nothing -> throwError $ "variable of wrong type. expected: " ++
+          show ty1 ++ ", found: " ++ show ty2
 
 gt0 :: Expr 'IntTy -> Expr 'BoolTy
 gt0 x = Gt x 0
@@ -486,9 +502,9 @@ mkTest' expectValid envExpr = do
   (valid, vacuous) <- io $ do
     (,) <$> isTheorem constraints <*> isVacuous constraints
 
-  -- io $ do
-  --   thmResult <- prove constraints
-  --   print thmResult
+  io $ do
+    result <- prove constraints
+    print result
 
   -- traceM $ "valid: "   ++ show valid
   -- traceM $ "vacuous: " ++ show vacuous
@@ -647,7 +663,7 @@ main = do
             `Gt`
             2
 
-    , scope "sum (map (const 1) [length 3 && at 2 == 1000] 3" $
+    , scope "sum (map (const 1) [length 3 && at 2 == 1000] == 3" $
         mkTest' Valid $ do
           [ai, bi, ci] <- sIntegers ["a", "b", "c"]
           let lst :: Expr ('List 'IntTy)
@@ -660,6 +676,24 @@ main = do
                 , ("c", Exists SInt $ SymI ci)
                 ]
               expr = mkFold (const 1) Add lst
+                `eq`
+                3
+
+          pure (m, expr)
+
+    , scope "sum [length 3 && at 2 == 1000] == 3" $
+        mkTest' Invalid $ do
+          [ai, bi, ci] <- sIntegers ["a", "b", "c"]
+          let lst :: Expr ('List 'IntTy)
+              lst = ListInfo $ AndInfo
+                (LitList [VarI "a", VarI "b", VarI "c"])
+                (AtInfo 2 1000)
+              m = Map.fromList
+                [ ("a", Exists SInt $ SymI ai)
+                , ("b", Exists SInt $ SymI bi)
+                , ("c", Exists SInt $ SymI ci)
+                ]
+              expr = mkFold id Add lst
                 `eq`
                 3
 
