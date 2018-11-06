@@ -20,6 +20,9 @@
 {-# LANGUAGE Rank2Types           #-}
 module Main where
 
+import Control.Monad.Reader
+import Data.Map (Map)
+import qualified Data.Map as Map
 import Data.Foldable (foldrM)
 import Control.Monad.Except
 import           Data.SBV
@@ -118,6 +121,8 @@ data Expr (ty :: Ty) where
   SymB         :: SBV Bool    -> Expr 'BoolTy
   SymI         :: SBV Integer -> Expr 'IntTy
 
+  Var :: SingTy a -> String -> Expr a
+
   ListInfo     :: ListInfo a -> Expr ('List a)
 
 symOf :: SingTy ty -> SBV (Concrete ty) -> Expr ty
@@ -130,10 +135,10 @@ litOf (SList ty) l = ListInfo $ LitList $ litOf ty <$> l
 litOf SInt       i = LitI i
 litOf SBool      b = LitB b
 
-varOf :: SingTy ty -> String -> Expr ty
-varOf (SList _) _ = error "we don't support list variables"
-varOf SInt      v = symOf SInt  (uninterpret v)
-varOf SBool     v = symOf SBool (uninterpret v)
+symVarOf :: SingTy ty -> String -> Expr ty
+symVarOf (SList _) _ = error "we don't support list variables"
+symVarOf SInt      v = symOf SInt  (uninterpret v)
+symVarOf SBool     v = symOf SBool (uninterpret v)
 
 eqOf :: SingTy ty -> Concrete ty -> Concrete ty -> Bool
 eqOf (SList ty) a b = length a == length b && and (zipWith (eqOf ty) a b)
@@ -217,7 +222,7 @@ instance Show (ListInfo ty) where
       . showString " "
       . showsPrec 11 b
       . showString " "
-      . showsPrec 11 (f (varOf a "x"))
+      . showsPrec 11 (f (symVarOf a "x"))
       . showString " "
       . showsPrec 11 fold
       . showString " "
@@ -251,7 +256,7 @@ instance Show (Expr ty) where
         showString "ListMap "
       . showsPrec 11 a
       . showString " "
-      . showsPrec 11 (f (varOf a "x"))
+      . showsPrec 11 (f (symVarOf a "x"))
       . showString " "
       . showsPrec 11 as
     ListLen as ->
@@ -263,7 +268,7 @@ instance Show (Expr ty) where
       . showString " "
       . showsPrec 11 b
       . showString " "
-      . showsPrec 11 (f (varOf a "x"))
+      . showsPrec 11 (f (symVarOf a "x"))
       . showString " "
       . showsPrec 11 fempty
       . showString " "
@@ -341,10 +346,12 @@ forceRight :: Either a b -> b
 forceRight (Left _) = error "unexpected left"
 forceRight (Right b) = b
 
-sEval' :: Expr ty -> Symbolic (SBV (Concrete ty))
-sEval' x = forceRight <$> runExceptT (sEval x)
+sEval' :: Map String Existential -> Expr ty -> Symbolic (SBV (Concrete ty))
+sEval' m x = forceRight <$> runReaderT (runExceptT (sEval x)) m
 
-type Eval ty = ExceptT String Symbolic (SBV (Concrete ty))
+type Eval ty = ExceptT String
+  (ReaderT (Map String Existential)
+  Symbolic) (SBV (Concrete ty))
 
 sEval :: forall ty. Expr ty -> Eval ty
 sEval = \case
@@ -354,31 +361,31 @@ sEval = \case
   ListMap{}             -> throwError "can't map with sbv lists"
 
   ListLen (ListInfo (OrInfo a b)) -> do
-    x  <- lift free_
+    x  <- lift $ lift free_
     a' <- sEval $ ListLen $ ListInfo a
     b' <- sEval $ ListLen $ ListInfo b
-    lift $ constrain $ x .== a' ||| x .== b'
+    lift $ lift $ constrain $ x .== a' ||| x .== b'
     pure x
 
   ListLen (ListInfo (AndInfo a b)) -> do
     a' <- sEval $ ListLen $ ListInfo a
     b' <- sEval $ ListLen $ ListInfo b
-    lift $ constrain $ a' .== b'
+    lift $ lift $ constrain $ a' .== b'
     pure a'
 
   ListLen (ListInfo (LitList l)) -> pure $ literal $ fromIntegral $ length l
 
   ListFold tyA tyB f fold (ListInfo (OrInfo a b)) -> withSymWord tyB $ do
-    x <- lift free_
+    x <- lift $ lift free_
     a' <- sEval $ ListFold tyA tyB f fold $ ListInfo a
     b' <- sEval $ ListFold tyA tyB f fold $ ListInfo b
-    lift $ constrain $ x .== a' ||| x .== b'
+    lift $ lift $ constrain $ x .== a' ||| x .== b'
     pure x
 
   ListFold tyA tyB f fold (ListInfo (AndInfo a b)) -> do
     a' <- sEval $ ListFold tyA tyB f fold $ ListInfo a
     b' <- sEval $ ListFold tyA tyB f fold $ ListInfo b
-    lift $ constrain $ a' .== b'
+    lift $ lift $ constrain $ a' .== b'
     pure a'
 
   ListFold _a _b f fold (ListInfo (LitList l)) ->  do
@@ -397,12 +404,12 @@ sEval = \case
 
         -- show that our knowledge is at least as strong as the assumption
         -- TODO: this may not be quite right
-        precondition <- lift $ forAllOf a1 $ \someA ->
-          forAllOf b $ \someB -> do
-            knowledge  <- sEval' $ g someA -- `eq` someB -- result
-            assumption <- sEval' $ f someA -- `eq` someB -- sym init
-            pure $ knowledge ==> assumption
-        lift $ constrain precondition
+        env <- ask
+        precondition <- lift $ lift $ forAllOf a1 $ \someA -> do
+          knowledge  <- sEval' env $ g someA
+          assumption <- sEval' env $ f someA
+          pure $ knowledge ==> assumption
+        lift $ lift $ constrain precondition
 
         sEval result
 
@@ -414,11 +421,12 @@ sEval = \case
 
         -- The function we know about and the function we're asking about must
         -- be extensionally equal
-        precondition <- lift $ forAllOf a1 $ \i -> do
-          knowledge  <- sEval' $ g i
-          assumption <- sEval' $ f i
+        env <- ask
+        precondition <- lift $ lift $ forAllOf a1 $ \someA -> do
+          knowledge  <- sEval' env $ g someA
+          assumption <- sEval' env $ f someA
           pure $ knowledge .== assumption
-        lift $ constrain precondition
+        lift $ lift $ constrain precondition
 
         sEval result
 
@@ -433,7 +441,7 @@ sEval = \case
     case (unliteral i', unliteral j') of
       (Just i'', Just j'') -> if i'' == j'' then sEval v else throwError ""
 
-  ListFold _ tyB _ _ (ListInfo (AtInfo _ _)) -> withSymWord tyB $ lift free_
+  ListFold _ tyB _ _ (ListInfo (AtInfo _ _)) -> withSymWord tyB $ lift $ lift free_
 
   ListAt i (ListInfo (LitList l)) -> do
     i' <- sEval i
@@ -465,10 +473,13 @@ lte0 :: Expr 'IntTy -> Expr 'BoolTy
 lte0 x = Not (Gt x 0)
 
 mkTest :: Validity -> Symbolic (Expr 'BoolTy) -> Test ()
-mkTest expectValid expr = do
+mkTest expectValid expr = mkTest' expectValid ((Map.empty,) <$> expr)
+
+mkTest' :: Validity -> Symbolic (Map String Existential, Expr 'BoolTy) -> Test ()
+mkTest' expectValid envExpr = do
   let constraints = do
-        expr'  <- expr
-        result <- runExceptT $ sEval expr'
+        (env, expr)  <- envExpr
+        result <- runReaderT (runExceptT (sEval expr)) env
         case result of
           Left msg      -> error msg
           Right result' -> pure result'
@@ -515,6 +526,12 @@ mkFold
   :: (Sing a, Sing b)
   => (Expr a -> Expr b) -> Fold b -> Expr ('List a) -> Expr b
 mkFold = ListFold sing sing
+
+pattern VarI :: String -> Expr 'IntTy
+pattern VarI name = Var SInt name
+
+pattern VarB :: String -> Expr 'BoolTy
+pattern VarB name = Var SBool name
 
 main :: IO ()
 main = do
@@ -631,14 +648,20 @@ main = do
             2
 
     , scope "sum (map (const 1) [length 3 && at 2 == 1000] 3" $
-        mkTest Valid $ do
-          [a, b, c] <- sIntegers ["a", "b", "c"]
+        mkTest' Valid $ do
+          [ai, bi, ci] <- sIntegers ["a", "b", "c"]
           let lst :: Expr ('List 'IntTy)
               lst = ListInfo $ AndInfo
-                (LitList $ sym <$> [a, b, c])
+                (LitList [VarI "a", VarI "b", VarI "c"])
                 (AtInfo 2 1000)
-          pure $
-            mkFold (const 1) Add lst
-            `eq`
-            3
+              m = Map.fromList
+                [ ("a", Exists SInt $ SymI ai)
+                , ("b", Exists SInt $ SymI bi)
+                , ("c", Exists SInt $ SymI ci)
+                ]
+              expr = mkFold (const 1) Add lst
+                `eq`
+                3
+
+          pure (m, expr)
     ]
