@@ -17,6 +17,7 @@
 {-# LANGUAGE PatternSynonyms      #-}
 {-# LANGUAGE StandaloneDeriving   #-}
 {-# LANGUAGE TupleSections        #-}
+{-# LANGUAGE Rank2Types           #-}
 module Main where
 
 import Data.Foldable (foldrM)
@@ -28,6 +29,7 @@ import           EasyTest
 import           Prelude       as P hiding (concat, init)
 import Data.List (find)
 import           Data.Type.Equality           ((:~:) (Refl), apply)
+import Data.Constraint (withDict, Dict(Dict))
 
 import Debug.Trace
 
@@ -76,6 +78,20 @@ instance Sing 'IntTy where
 instance Sing a => Sing ('List a) where
   sing = SList sing
 
+withEq :: forall a r. SingTy a -> (Eq (Concrete a) => r) -> r
+withEq ty = withDict dict
+  where dict :: Dict (Eq (Concrete a))
+        dict = case ty of
+          SInt    -> Dict
+          SBool   -> Dict
+          SList a -> withEq a $ Dict
+
+withSymWord :: forall a r. SingTy a -> (SymWord (Concrete a) => r) -> r
+withSymWord ty f = case ty of
+  SInt    -> withDict (Dict :: Dict (SymWord (Concrete a))) f
+  SBool   -> withDict (Dict :: Dict (SymWord (Concrete a))) f
+  SList _ -> error "bad"
+
 data Expr (ty :: Ty) where
   -- transducers
   ListCat
@@ -87,7 +103,8 @@ data Expr (ty :: Ty) where
   ListAt       ::        Expr 'IntTy -> Expr ('List a) -> Expr a
   ListContains :: SingTy a -> Expr a -> Expr ('List a) -> Expr 'BoolTy
   ListFold
-    :: SingTy a -> (Expr a -> Expr b) -> Fold b -> Expr ('List a) -> Expr b
+    :: SingTy a -> SingTy b
+    -> (Expr a -> Expr b) -> Fold b -> Expr ('List a) -> Expr b
 
   -- other
   Eq           :: SingTy a -> Expr a -> Expr a -> Expr 'BoolTy
@@ -171,7 +188,7 @@ sFoldOp = \case
   And -> (&&&)
 
 data ListInfo (ty :: Ty) where
-  LitList      :: [Expr a]    -> ListInfo a
+  LitList :: [Expr a] -> ListInfo a
   FoldInfo
     :: SingTy a
     -> SingTy b
@@ -183,7 +200,7 @@ data ListInfo (ty :: Ty) where
     -> Expr b
     -> ListInfo a
 
-  AtInfo       :: Expr 'IntTy -> Expr a -> ListInfo a
+  AtInfo :: Expr 'IntTy -> Expr a -> ListInfo a
 
   OrInfo  :: ListInfo a -> ListInfo a -> ListInfo a
   AndInfo :: ListInfo a -> ListInfo a -> ListInfo a
@@ -240,9 +257,11 @@ instance Show (Expr ty) where
     ListLen as ->
         showString "ListLen "
       . showsPrec 11 as
-    ListFold a f fempty as ->
+    ListFold a b f fempty as ->
         showString "ListFold "
       . showsPrec 11 a
+      . showString " "
+      . showsPrec 11 b
       . showString " "
       . showsPrec 11 (f (varOf a "x"))
       . showString " "
@@ -295,7 +314,7 @@ eval = \case
   ListCat _ a b      -> eval a <> eval b
   ListMap a f as     -> eval . f . litOf a <$> eval as
   ListLen l          -> fromIntegral $ length $ eval l
-  ListFold a f fold l  -> foldr
+  ListFold a _b f fold l -> foldr
     (foldOp fold)
     (eval (empty fold))
     (fmap (eval . f . litOf a) (eval l))
@@ -327,16 +346,42 @@ sEval' x = forceRight <$> runExceptT (sEval x)
 
 type Eval ty = ExceptT String Symbolic (SBV (Concrete ty))
 
-sEval :: Expr ty -> Eval ty
+sEval :: forall ty. Expr ty -> Eval ty
 sEval = \case
   ListCat SBool a b     -> (.++) <$> sEval a <*> sEval b
   ListCat SInt  a b     -> (.++) <$> sEval a <*> sEval b
   ListCat (SList _) a b -> throwError "nested lists not allowed"
   ListMap{}             -> throwError "can't map with sbv lists"
 
+  ListLen (ListInfo (OrInfo a b)) -> do
+    x  <- lift free_
+    a' <- sEval $ ListLen $ ListInfo a
+    b' <- sEval $ ListLen $ ListInfo b
+    lift $ constrain $ x .== a' ||| x .== b'
+    pure x
+
+  ListLen (ListInfo (AndInfo a b)) -> do
+    a' <- sEval $ ListLen $ ListInfo a
+    b' <- sEval $ ListLen $ ListInfo b
+    lift $ constrain $ a' .== b'
+    pure a'
+
   ListLen (ListInfo (LitList l)) -> pure $ literal $ fromIntegral $ length l
 
-  ListFold _a f fold (ListInfo (LitList l)) ->  do
+  ListFold tyA tyB f fold (ListInfo (OrInfo a b)) -> withSymWord tyB $ do
+    x <- lift free_
+    a' <- sEval $ ListFold tyA tyB f fold $ ListInfo a
+    b' <- sEval $ ListFold tyA tyB f fold $ ListInfo b
+    lift $ constrain $ x .== a' ||| x .== b'
+    pure x
+
+  ListFold tyA tyB f fold (ListInfo (AndInfo a b)) -> do
+    a' <- sEval $ ListFold tyA tyB f fold $ ListInfo a
+    b' <- sEval $ ListFold tyA tyB f fold $ ListInfo b
+    lift $ constrain $ a' .== b'
+    pure a'
+
+  ListFold _a _b f fold (ListInfo (LitList l)) ->  do
     init  <- sEval (empty fold)
     elems <- traverse (sEval . f) l
     foldrM
@@ -344,7 +389,7 @@ sEval = \case
       init
       elems
 
-  ListFold a1 f And (ListInfo (FoldInfo a2 b g And result)) ->
+  ListFold a1 _b f And (ListInfo (FoldInfo a2 b g And result)) ->
     case singEq a1 a2 of
       Nothing   -> throwError "can't compare folds of different types"
       Just Refl -> do
@@ -361,7 +406,7 @@ sEval = \case
 
         sEval result
 
-  ListFold a1 f Add (ListInfo (FoldInfo a2 _b g Add result)) -> do
+  ListFold a1 _b1 f Add (ListInfo (FoldInfo a2 _b2 g Add result)) -> do
     case singEq a1 a2 of
       Nothing   -> throwError "can't compare folds of different types"
       Just Refl -> do
@@ -377,16 +422,18 @@ sEval = \case
 
         sEval result
 
-  ListFold a f fold (ListCat _ l1 l2) -> do
+  ListFold a b f fold (ListCat _ l1 l2) -> do
     sFoldOp fold
-      <$> sEval (ListFold a f fold l1)
-      <*> sEval (ListFold a f fold l2)
+      <$> sEval (ListFold a b f fold l1)
+      <*> sEval (ListFold a b f fold l2)
 
   ListAt i (ListInfo (AtInfo j v)) -> do
     i' <- sEval i
     j' <- sEval j
     case (unliteral i', unliteral j') of
       (Just i'', Just j'') -> if i'' == j'' then sEval v else throwError ""
+
+  ListFold _ tyB _ _ (ListInfo (AtInfo _ _)) -> withSymWord tyB $ lift free_
 
   ListAt i (ListInfo (LitList l)) -> do
     i' <- sEval i
@@ -444,12 +491,12 @@ data Validity = Valid | Invalid
 mkAny
   :: Sing a
   => (Expr a -> Expr 'BoolTy) -> ListInfo a -> Expr 'BoolTy
-mkAny f = bnot . ListFold sing (bnot . f) And . ListInfo
+mkAny f = bnot . ListFold sing sing (bnot . f) And . ListInfo
 
 mkAll
   :: Sing a
   => (Expr a -> Expr 'BoolTy) -> ListInfo a -> Expr 'BoolTy
-mkAll f = ListFold sing f And . ListInfo
+mkAll f = ListFold sing sing f And . ListInfo
 
 mkAnd :: ListInfo 'BoolTy -> Expr 'BoolTy
 mkAnd = mkAll id
@@ -465,9 +512,9 @@ mkFoldInfo
 mkFoldInfo = FoldInfo sing sing
 
 mkFold
-  :: Sing a
+  :: (Sing a, Sing b)
   => (Expr a -> Expr b) -> Fold b -> Expr ('List a) -> Expr b
-mkFold = ListFold sing
+mkFold = ListFold sing sing
 
 main :: IO ()
 main = do
@@ -570,4 +617,28 @@ main = do
             mkFold (const 1) Add lst
             `eq`
             7
+
+    , scope "sum (map (const 1) [length 3 || length 4] > 2" $
+        mkTest Valid $ do
+          [a, b, c, d, e, f, g] <- sIntegers ["a", "b", "c", "d", "e", "f", "g"]
+          let lst :: Expr ('List 'IntTy)
+              lst = ListInfo $ OrInfo
+                (LitList $ sym <$> [a, b, c])
+                (LitList $ sym <$> [d, e, f, g])
+          pure $
+            mkFold (const 1) Add lst
+            `Gt`
+            2
+
+    , scope "sum (map (const 1) [length 3 && at 2 == 1000] 3" $
+        mkTest Valid $ do
+          [a, b, c] <- sIntegers ["a", "b", "c"]
+          let lst :: Expr ('List 'IntTy)
+              lst = ListInfo $ AndInfo
+                (LitList $ sym <$> [a, b, c])
+                (AtInfo 2 1000)
+          pure $
+            mkFold (const 1) Add lst
+            `eq`
+            3
     ]
