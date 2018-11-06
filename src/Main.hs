@@ -16,17 +16,20 @@
 {-# LANGUAGE UndecidableInstances #-}
 {-# LANGUAGE PatternSynonyms      #-}
 {-# LANGUAGE StandaloneDeriving   #-}
+{-# LANGUAGE TupleSections        #-}
 module Main where
 
 import Data.Foldable (foldrM)
 import Control.Monad.Except
 import           Data.SBV
 import           Data.SBV.List ((.++))
+import           Data.SBV.Control hiding (io)
 import           EasyTest
 import           Prelude       as P hiding (concat, init)
 import Data.List (find)
 import           Data.Type.Equality           ((:~:) (Refl), apply)
 
+import Debug.Trace
 
 data Ty
   = List Ty
@@ -75,13 +78,16 @@ instance Sing a => Sing ('List a) where
 
 data Expr (ty :: Ty) where
   -- transducers
-  ListCat      :: SingTy a -> Expr ('List a)     -> Expr ('List a) -> Expr ('List a)
-  ListMap      :: SingTy a -> (Expr a -> Expr b) -> Expr ('List a) -> Expr ('List b)
+  ListCat
+    :: SingTy a -> Expr ('List a)     -> Expr ('List a) -> Expr ('List a)
+  ListMap
+    :: SingTy a -> (Expr a -> Expr b) -> Expr ('List a) -> Expr ('List b)
 
-  ListLen      ::                                             Expr ('List a) -> Expr 'IntTy
-  ListFold     :: SingTy a -> (Expr a -> Expr b) -> Fold b -> Expr ('List a) -> Expr b
-  ListAt       ::                              Expr 'IntTy -> Expr ('List a) -> Expr a
-  ListContains ::                       SingTy a -> Expr a -> Expr ('List a) -> Expr 'BoolTy
+  ListLen      ::                       Expr ('List a) -> Expr 'IntTy
+  ListAt       ::        Expr 'IntTy -> Expr ('List a) -> Expr a
+  ListContains :: SingTy a -> Expr a -> Expr ('List a) -> Expr 'BoolTy
+  ListFold
+    :: SingTy a -> (Expr a -> Expr b) -> Fold b -> Expr ('List a) -> Expr b
 
   -- other
   Eq           :: SingTy a -> Expr a -> Expr a -> Expr 'BoolTy
@@ -348,32 +354,33 @@ sEval = \case
         -- TODO: this may not be quite right
         precondition <- lift $ forAllOf a1 $ \someA ->
           forAllOf b $ \someB -> do
-            knowledge  <- sEval' $ f someA -- `eq` someB -- sym init
-            assumption <- sEval' $ g someA -- `eq` someB -- result
+            knowledge  <- sEval' $ g someA -- `eq` someB -- result
+            assumption <- sEval' $ f someA -- `eq` someB -- sym init
             pure $ knowledge ==> assumption
         lift $ constrain precondition
 
         sEval result
 
-  ListFold a1 f Add (ListInfo (FoldInfo a2 _b g Add result)) ->
+  ListFold a1 f Add (ListInfo (FoldInfo a2 _b g Add result)) -> do
     case singEq a1 a2 of
       Nothing   -> throwError "can't compare folds of different types"
       Just Refl -> do
         init <- sEval (empty Add)
 
-        -- show that our knowledge is at least as strong as the assumption
-        -- TODO: this is not quite right
+        -- The function we know about and the function we're asking about must
+        -- be extensionally equal
         precondition <- lift $ forAllOf a1 $ \i -> do
-          knowledge  <- sEval' $ f i `eq` sym init
-          assumption <- sEval' $ g i `eq` result
-          pure $ knowledge ==> assumption
+          knowledge  <- sEval' $ g i
+          assumption <- sEval' $ f i
+          pure $ knowledge .== assumption
         lift $ constrain precondition
 
         sEval result
 
-  ListFold a f fold (ListCat _ l1 l2) -> sFoldOp fold
-    <$> sEval (ListFold a f fold l1)
-    <*> sEval (ListFold a f fold l2)
+  ListFold a f fold (ListCat _ l1 l2) -> do
+    sFoldOp fold
+      <$> sEval (ListFold a f fold l1)
+      <*> sEval (ListFold a f fold l2)
 
   ListAt i (ListInfo (AtInfo j v)) -> do
     i' <- sEval i
@@ -412,18 +419,24 @@ lte0 x = Not (Gt x 0)
 
 mkTest :: Validity -> Symbolic (Expr 'BoolTy) -> Test ()
 mkTest expectValid expr = do
+  let constraints = do
+        expr'  <- expr
+        result <- runExceptT $ sEval expr'
+        case result of
+          Left msg      -> error msg
+          Right result' -> pure result'
   (valid, vacuous) <- io $ do
-    let constraints = do
-          expr'  <- expr
-          result <- runExceptT $ sEval expr'
-          case result of
-            Left msg      -> error msg
-            Right result' -> constrain result'
     (,) <$> isTheorem constraints <*> isVacuous constraints
 
+  -- io $ do
+  --   thmResult <- prove constraints
+  --   print thmResult
+
+  -- traceM $ "valid: "   ++ show valid
+  -- traceM $ "vacuous: " ++ show vacuous
   expect $ if expectValid == Valid
-    then valid
-    else (not valid || vacuous)
+    then valid && not vacuous
+    else not valid || vacuous
 
 data Validity = Valid | Invalid
   deriving Eq
@@ -431,7 +444,7 @@ data Validity = Valid | Invalid
 mkAny
   :: Sing a
   => (Expr a -> Expr 'BoolTy) -> ListInfo a -> Expr 'BoolTy
-mkAny f = ListFold sing (bnot . f) And . ListInfo
+mkAny f = bnot . ListFold sing (bnot . f) And . ListInfo
 
 mkAll
   :: Sing a
@@ -482,10 +495,10 @@ main = do
           a <- sInteger "a"
           pure $ mkAny gt0 $ LitList [sym a, lit (-1), 3]
 
-    , scope "all (> 0) [a, -1, 3]" $
+    , scope "all (> 0) [a, 1, 3]" $
       mkTest Invalid  $ do
         a <- sInteger "a"
-        pure $ mkAll gt0 $ LitList [sym a, lit (-1), 3]
+        pure $ mkAll gt0 $ LitList [sym a, lit 1, 3]
 
     , scope "length [] == 0" $
         mkTest Valid $ pure $ ListLen (ListInfo (LitList [])) `eq` 0
@@ -523,15 +536,15 @@ main = do
           mkAnd $ mkFoldInfo id And false
 
     , scope "and [false] /= true" $
-        mkTest Valid $ pure $
-          mkAnd $ mkFoldInfo id And false
+        mkTest Valid $ pure $ bnot $
+          mkAnd (mkFoldInfo id And false) `eq` true
 
     , scope "all (> 0) => (not (any (> 0)) == false)" $
         mkTest Invalid $ pure $
           bnot $ mkAny gt0 $ allInfo gt0
 
     , scope "any (<= 0) => not (all (> 0))" $
-        mkTest Valid $ pure $
+        mkTest Valid $ pure $ bnot $
           mkAll gt0 $ mkFoldInfo (bnot . lte0) And false
 
     , scope "at 2 [1, 2, 3] == 3" $
