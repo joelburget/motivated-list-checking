@@ -37,9 +37,7 @@ import Data.List (find)
 import           Data.Type.Equality           ((:~:) (Refl), apply)
 import Data.Constraint (withDict, Dict(Dict))
 import Control.Monad.Loops
-import Data.Map.Merge.Lazy
-
-import Debug.Trace
+import Control.Lens hiding (List, Fold, (.>), op)
 
 
 data Ty
@@ -182,22 +180,20 @@ normalizeExpr tm = case tm of
   Var{} -> pure tm
   NormalListInfo{} -> pure tm
   ListInfo ty i -> do
-    ix <- get
-    put $ succ ix
-    tell $ Map.singleton ix $ ELI ty i
-    pure $ NormalListInfo ty ix
+    pos <- id <<+= 1
+    tell $ Map.singleton pos $ ELI ty i
+    pure $ NormalListInfo ty pos
 
 mergeConcreteReps
-  :: Map Int ELI
-  -> Map Int (Either (ETy, Int) EConcreteList)
-  -> Map Int ELI
-mergeConcreteReps elis econs = merge
-  dropMissing dropMissing
-  (zipWithMatched (\_ eli@(ELI ty1 li) econ -> case econ of
+  :: [ELI]
+  -> [(Either (ETy, Int) EConcreteList)]
+  -> [ELI]
+mergeConcreteReps elis econs = zipWith
+  (\eli@(ELI ty1 li) econ -> case econ of
     Left _ -> eli -- we haven't started concretizing this list yet
     Right (EConcreteList ty2 list) -> case singEq ty1 ty2 of
       Nothing   -> error "impossible"
-      Just Refl -> ELI ty1 (AndInfo li (LitList list))))
+      Just Refl -> ELI ty1 (AndInfo li (LitList list)))
   elis econs
 
 mkVars
@@ -461,22 +457,21 @@ forceRight (Right b) = b
 
 sEval'
  :: Map String Existential
- -> Map Int ELI
+ -> [ELI]
  -> Expr ty
  -> Symbolic (SBV (Concrete ty))
 sEval' vars infos x
   = forceRight <$> runReaderT (runExceptT (sEval x)) (vars, infos)
 
 type SEval ty = ExceptT String
-  (ReaderT (Map String Existential, Map Int ELI)
+  (ReaderT (Map String Existential, [ELI])
   Symbolic) ty
 
 viewInfo :: SingTy a -> Int -> SEval (ListInfo a)
-viewInfo ty ix = do
+viewInfo ty pos = do
   (_, infos) <- ask
-  case Map.lookup ix infos of
-    Nothing -> throwError "failed to look up list info"
-    Just (ELI ty' li) -> case singEq ty ty' of
+  case infos !! pos of
+    ELI ty' li -> case singEq ty ty' of
       Nothing   -> throwError "got list info of wrong type"
       Just Refl -> pure li
 
@@ -487,17 +482,17 @@ sEval = \case
   ListCat (SList _) _ _ -> throwError "nested lists not allowed"
   ListMap{}             -> throwError "can't map with sbv lists"
 
-  ListLen (NormalListInfo ty ix) -> do
-    li <- viewInfo ty ix
+  ListLen (NormalListInfo ty pos) -> do
+    li <- viewInfo ty pos
     sEval $ ListLen $ ListInfo ty li
-  ListFold tyA tyB f fold (NormalListInfo ty ix) -> do
-    li <- viewInfo ty ix
+  ListFold tyA tyB f fold (NormalListInfo ty pos) -> do
+    li <- viewInfo ty pos
     sEval $ ListFold tyA tyB f fold $ ListInfo ty li
-  ListAt i (NormalListInfo ty ix) -> do
-    li <- viewInfo ty ix
+  ListAt i (NormalListInfo ty pos) -> do
+    li <- viewInfo ty pos
     sEval $ ListAt i $ ListInfo ty li
 
-  -- ListContains i (NormalListInfo _ ix)
+  -- ListContains i (NormalListInfo _ pos)
 
   ListLen (ListInfo ty (OrInfo a b)) -> do
     x  <- lift $ lift free_
@@ -622,21 +617,25 @@ gt0 x = Gt x 0
 lte0 :: Expr 'IntTy -> Expr 'BoolTy
 lte0 x = Not (Gt x 0)
 
-(<&>) :: Functor f => f a -> (a -> b) -> f b
-(<&>) = flip fmap
-
 mkTest
   :: Validity -> Expr 'BoolTy -> Test ()
 mkTest expectValid expr = mkTest' expectValid expr (pure Map.empty)
 
+runNormalize :: Expr a -> (Expr a, [ELI])
+runNormalize expr =
+  let (expr', infos) = runWriter $ evalStateT (normalizeExpr expr) 0
+      maxIx = maximum $ Map.keys infos
+      infos' = [0..maxIx] <&> \pos -> infos Map.! pos
+  in (expr', infos')
+
 mkTest'
   :: Validity -> Expr 'BoolTy -> Symbolic (Map String Existential) -> Test ()
 mkTest' expectValid expr sEnv = do
-  let (expr', infos) = runWriter $ evalStateT (normalizeExpr expr) 0
+  let (expr', infos) = runNormalize expr
 
       constraints
         :: Symbolic (Map String Existential)
-        -> Map Int ELI
+        -> [ELI]
         -> Symbolic (SBV Bool)
       constraints sEnv' infos' = do
         env <- sEnv'
@@ -666,25 +665,22 @@ mkTest' expectValid expr sEnv = do
   -- found model as constraints for new model
 
   -- Either index to start search at or concrete (skeleton of) counterexample
-  let concreteReps :: Map Int (Either (ETy, Int) EConcreteList)
+  let concreteReps :: [Either (ETy, Int) EConcreteList]
       concreteReps = infos <&> \(ELI ty li) -> case extractConcreteList li of
         Nothing -> Left (ETy ty, 0)
         Just xs -> Right $ EConcreteList ty xs
+      numLists = length concreteReps
 
   concreteResults <-
-    io $ flip execStateT concreteReps $ forM_ (Map.keys concreteReps) $ \listIx ->
-      whileM_ (do reps <- get
-                  pure $ case reps Map.! listIx of
-                    Left{}  -> True
-                    Right{} -> False) $ do
-        reps <- get
-        case reps Map.! listIx of
+    io $ flip execStateT concreteReps $ forM_ [0..numLists - 1] $ \listIx ->
+      whileM_ (isn't _Right <$> use (singular (ix listIx))) $ do
+        rep <- use $ singular $ ix listIx
+        case rep of
           Right{} -> error "impossible"
           Left (ETy ty, startingLen) -> do
             let (vars, varEnv) = mkVars ty listIx startingLen
                 list = EConcreteList ty vars
-                concreteReps' = Map.update (const (Just (Right list))) listIx
-                  concreteReps
+                concreteReps' = concreteReps & ix listIx .~ Right list
                 infos' = mergeConcreteReps infos concreteReps'
                 sEnv' = Map.union <$> sEnv <*> varEnv
 
@@ -695,21 +691,24 @@ mkTest' expectValid expr sEnv = do
             -- traceM $ "valid': " ++ show valid'
             -- traceM $ "vacuous': " ++ show vacuous'
 
+            -- liftIO $ do
+            --   result <- prove $ constraints sEnv' infos'
+            --   print result
+
             if valid' && not vacuous'
 
             -- we failed to find a falsifying model at this length -- try a
             -- longer list
             then if startingLen < 50
-                 then put $ Map.insert listIx (Left (ETy ty, succ startingLen))
-                        reps
+                 then modify $ ix listIx .~ Left (ETy ty, succ startingLen)
                  else error "we probably should have found a model by now"
 
             -- we found a model
             else put concreteReps'
 
---   liftIO $ do
---     result <- prove $ constraints infos'
---     print result
+  -- liftIO $ do
+  --   result <- prove $ constraints _ _
+  --   print result
 
   -- liftIO $ print concreteResults
   pure ()
