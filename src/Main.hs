@@ -20,7 +20,10 @@
 {-# LANGUAGE Rank2Types           #-}
 module Main where
 
+import Control.Applicative ((<|>))
 import Control.Monad.Reader
+import Control.Monad.State
+import Control.Monad.Writer
 import Data.Map (Map)
 import qualified Data.Map as Map
 import Data.Foldable (foldrM)
@@ -33,6 +36,10 @@ import           Prelude       as P hiding (concat, init)
 import Data.List (find)
 import           Data.Type.Equality           ((:~:) (Refl), apply)
 import Data.Constraint (withDict, Dict(Dict))
+import Control.Monad.Loops
+import Data.Map.Merge.Lazy
+
+import Debug.Trace
 
 
 data Ty
@@ -63,11 +70,39 @@ type family Concrete (ty :: Ty) where
   Concrete 'IntTy    = Integer
   Concrete 'BoolTy   = Bool
 
+data ETy where
+  ETy :: SingTy ty -> ETy
+
+instance Show ETy where
+  showsPrec p (ETy ty) = showParen (p > 10) $
+      showString "ETy "
+    . showsPrec 11 ty
+
 data Existential where
   Exists :: SingTy ty -> Expr ty -> Existential
 
+data ELI where
+  ELI :: SingTy ty -> ListInfo ty -> ELI
+
+instance Show ELI where
+  showsPrec p (ELI ty info) = showParen (p > 10) $
+      showString "ELI "
+    . showsPrec 11 ty
+    . showString " "
+    . showsPrec 11 info
+
+data EConcreteList where
+  EConcreteList :: SingTy ty -> [Expr ty] -> EConcreteList
+
+instance Show EConcreteList where
+  showsPrec p (EConcreteList ty list) = showParen (p > 10) $
+      showString "EConcreteList "
+    . showsPrec 11 ty
+    . showString " "
+    . showsPrec 11 list
+
 example :: Existential
-example = Exists (SList SInt) (ListInfo (LitList [1, 2, 3]))
+example = Exists (SList SInt) (ListInfo sing (LitList [1, 2, 3]))
 
 class Sing ty where
   sing :: SingTy ty
@@ -123,7 +158,60 @@ data Expr (ty :: Ty) where
 
   Var :: SingTy a -> String -> Expr a
 
-  ListInfo     :: ListInfo a -> Expr ('List a)
+  -- re ListInfo vs NormalListInfo: ListInfo is provided for convenience, but
+  -- we normalize to NormalListInfo
+  ListInfo       :: SingTy a -> ListInfo a -> Expr ('List a)
+  NormalListInfo :: SingTy a -> Int -> Expr ('List a)
+
+normalizeExpr :: Expr a -> StateT Int (Writer (Map Int ELI)) (Expr a)
+normalizeExpr tm = case tm of
+  ListCat ty a b -> ListCat ty <$> normalizeExpr a <*> normalizeExpr b
+  ListMap ty f a -> ListMap ty f <$> normalizeExpr a
+  ListLen a -> ListLen <$> normalizeExpr a
+  ListAt a b -> ListAt <$> normalizeExpr a <*> normalizeExpr b
+  ListContains ty a b -> ListContains ty <$> normalizeExpr a <*> normalizeExpr b
+  ListFold ty1 ty2 g f a -> ListFold ty1 ty2 g f <$> normalizeExpr a
+  Eq ty a b -> Eq ty <$> normalizeExpr a <*> normalizeExpr b
+  Gt a b -> Gt <$> normalizeExpr a <*> normalizeExpr b
+  Not a -> Not <$> normalizeExpr a
+  BinOp f a b -> BinOp f <$> normalizeExpr a <*> normalizeExpr b
+  LitB{} -> pure tm
+  LitI{} -> pure tm
+  SymB{} -> pure tm
+  SymI{} -> pure tm
+  Var{} -> pure tm
+  NormalListInfo{} -> pure tm
+  ListInfo ty i -> do
+    ix <- get
+    put $ succ ix
+    tell $ Map.singleton ix $ ELI ty i
+    pure $ NormalListInfo ty ix
+
+mergeConcreteReps
+  :: Map Int ELI
+  -> Map Int (Either (ETy, Int) EConcreteList)
+  -> Map Int ELI
+mergeConcreteReps elis econs = merge
+  dropMissing dropMissing
+  (zipWithMatched (\_ eli@(ELI ty1 li) econ -> case econ of
+    Left _ -> eli -- we haven't started concretizing this list yet
+    Right (EConcreteList ty2 list) -> case singEq ty1 ty2 of
+      Nothing   -> error "impossible"
+      Just Refl -> ELI ty1 (AndInfo li (LitList list))))
+  elis econs
+
+mkVars
+  :: SingTy ty -> Int -> Int -> ([Expr ty], Symbolic (Map String Existential))
+mkVars ty listIx len =
+  let varName exprIx = "var_" ++ show listIx ++ "_" ++ show exprIx
+      exprs = [0..len] <&> \exprIx -> Var ty $ varName exprIx
+      env = fmap Map.fromList $ forM [0..len] $ \exprIx ->
+        let name = varName exprIx
+        in (name,) <$> case ty of
+             SInt  -> Exists ty . SymI <$> sInteger name
+             SBool -> Exists ty . SymB <$> sBool name
+             _     -> error "unsupported var type"
+  in (exprs, env)
 
 symOf :: SingTy ty -> SBV (Concrete ty) -> Expr ty
 symOf (SList _) _ = error "we don't support symbolic lists"
@@ -131,7 +219,7 @@ symOf SInt  s     = SymI s
 symOf SBool s     = SymB s
 
 litOf :: SingTy ty -> Concrete ty -> Expr ty
-litOf (SList ty) l = ListInfo $ LitList $ litOf ty <$> l
+litOf (SList ty) l = ListInfo ty $ LitList $ litOf ty <$> l
 litOf SInt       i = LitI i
 litOf SBool      b = LitB b
 
@@ -209,6 +297,14 @@ data ListInfo (ty :: Ty) where
 
   OrInfo  :: ListInfo a -> ListInfo a -> ListInfo a
   AndInfo :: ListInfo a -> ListInfo a -> ListInfo a
+
+extractConcreteList :: ListInfo ty -> Maybe [Expr ty]
+extractConcreteList = \case
+  LitList lst -> Just lst
+  FoldInfo{} -> Nothing
+  AtInfo{} -> Nothing
+  OrInfo{} -> Nothing
+  AndInfo a b -> extractConcreteList a <|> extractConcreteList b
 
 allInfo :: (Sing a, b ~ 'BoolTy) => (Expr a -> Expr b) -> ListInfo a
 allInfo f = FoldInfo sing SBool f And (LitB True)
@@ -288,7 +384,16 @@ instance Show (Expr ty) where
 
     LitB a     -> showString "LitB "     . showsPrec 11 a
     LitI a     -> showString "LitI "     . showsPrec 11 a
-    ListInfo i -> showString "ListInfo " . showsPrec 11 i
+    ListInfo ty i ->
+        showString "ListInfo "
+      . showsPrec 11 ty
+      . showString " "
+      . showsPrec 11 i
+    NormalListInfo ty i ->
+        showString "NormalListInfo "
+      . showsPrec 11 ty
+      . showString " "
+      . showsPrec 11 i
 
     Eq ty a b ->
         showString "Eq "
@@ -341,10 +446,11 @@ eval = \case
 
   LitB a             -> a
   LitI a             -> a
-  ListInfo i -> case i of
+  ListInfo _ty i -> case i of
     LitList l -> fmap eval l
     _         -> error "can't evaluate non-literal list"
 
+  NormalListInfo _ _ -> error "cannot evaluate normal list info"
   SymB _  -> error "cannot evaluate symbolic value"
   SymI _  -> error "cannot evaluate symbolic value"
   Var _ _ -> error "cannot evaluate variable"
@@ -353,49 +459,75 @@ forceRight :: Either a b -> b
 forceRight (Left _) = error "unexpected left"
 forceRight (Right b) = b
 
-sEval' :: Map String Existential -> Expr ty -> Symbolic (SBV (Concrete ty))
-sEval' m x = forceRight <$> runReaderT (runExceptT (sEval x)) m
+sEval'
+ :: Map String Existential
+ -> Map Int ELI
+ -> Expr ty
+ -> Symbolic (SBV (Concrete ty))
+sEval' vars infos x
+  = forceRight <$> runReaderT (runExceptT (sEval x)) (vars, infos)
 
-type Eval ty = ExceptT String
-  (ReaderT (Map String Existential)
-  Symbolic) (SBV (Concrete ty))
+type SEval ty = ExceptT String
+  (ReaderT (Map String Existential, Map Int ELI)
+  Symbolic) ty
 
-sEval :: forall ty. Expr ty -> Eval ty
+viewInfo :: SingTy a -> Int -> SEval (ListInfo a)
+viewInfo ty ix = do
+  (_, infos) <- ask
+  case Map.lookup ix infos of
+    Nothing -> throwError "failed to look up list info"
+    Just (ELI ty' li) -> case singEq ty ty' of
+      Nothing   -> throwError "got list info of wrong type"
+      Just Refl -> pure li
+
+sEval :: forall ty. Expr ty -> SEval (SBV (Concrete ty))
 sEval = \case
   ListCat SBool a b     -> (.++) <$> sEval a <*> sEval b
   ListCat SInt  a b     -> (.++) <$> sEval a <*> sEval b
   ListCat (SList _) _ _ -> throwError "nested lists not allowed"
   ListMap{}             -> throwError "can't map with sbv lists"
 
-  ListLen (ListInfo (OrInfo a b)) -> do
+  ListLen (NormalListInfo ty ix) -> do
+    li <- viewInfo ty ix
+    sEval $ ListLen $ ListInfo ty li
+  ListFold tyA tyB f fold (NormalListInfo ty ix) -> do
+    li <- viewInfo ty ix
+    sEval $ ListFold tyA tyB f fold $ ListInfo ty li
+  ListAt i (NormalListInfo ty ix) -> do
+    li <- viewInfo ty ix
+    sEval $ ListAt i $ ListInfo ty li
+
+  -- ListContains i (NormalListInfo _ ix)
+
+  ListLen (ListInfo ty (OrInfo a b)) -> do
     x  <- lift $ lift free_
-    a' <- sEval $ ListLen $ ListInfo a
-    b' <- sEval $ ListLen $ ListInfo b
+    a' <- sEval $ ListLen $ ListInfo ty a
+    b' <- sEval $ ListLen $ ListInfo ty b
     lift $ lift $ constrain $ x .== a' ||| x .== b'
     pure x
 
-  ListLen (ListInfo (AndInfo a b)) -> do
-    a' <- sEval $ ListLen $ ListInfo a
-    b' <- sEval $ ListLen $ ListInfo b
+  ListLen (ListInfo ty (AndInfo a b)) -> do
+    a' <- sEval $ ListLen $ ListInfo ty a
+    b' <- sEval $ ListLen $ ListInfo ty b
     lift $ lift $ constrain $ a' .== b'
     pure a'
 
-  ListLen (ListInfo (LitList l)) -> pure $ literal $ fromIntegral $ length l
+  ListLen (ListInfo _ (LitList l)) -> pure $ literal $ fromIntegral $ length l
 
-  ListFold tyA tyB f fold (ListInfo (OrInfo a b)) -> withSymWord tyB $ do
+  ListFold tyA tyB f fold (ListInfo ty (OrInfo a b)) -> withSymWord tyB $ do
     x <- lift $ lift free_
-    a' <- sEval $ ListFold tyA tyB f fold $ ListInfo a
-    b' <- sEval $ ListFold tyA tyB f fold $ ListInfo b
+    a' <- sEval $ ListFold tyA tyB f fold $ ListInfo ty a
+    b' <- sEval $ ListFold tyA tyB f fold $ ListInfo ty b
     lift $ lift $ constrain $ x .== a' ||| x .== b'
     pure x
 
-  ListFold tyA tyB f fold (ListInfo (AndInfo a b)) -> do
-    a' <- sEval $ ListFold tyA tyB f fold $ ListInfo a
-    b' <- sEval $ ListFold tyA tyB f fold $ ListInfo b
+  ListFold tyA tyB f fold (ListInfo ty (AndInfo a b)) -> do
+    a' <- sEval $ ListFold tyA tyB f fold $ ListInfo ty a
+    b' <- sEval $ ListFold tyA tyB f fold $ ListInfo ty b
     lift $ lift $ constrain $ a' .== b'
     pure a'
 
-  ListFold _a _b f fold (ListInfo (LitList l)) ->  do
+  ListFold _a _b f fold (ListInfo _ (LitList l)) ->  do
     init  <- sEval (empty fold)
     elems <- traverse (sEval . f) l
     foldrM
@@ -403,31 +535,30 @@ sEval = \case
       init
       elems
 
-  ListFold a1 _b1 f And (ListInfo (FoldInfo a2 _b2 g And result)) ->
+  ListFold a1 _b1 f And (ListInfo _ (FoldInfo a2 _b2 g And result)) ->
     case singEq a1 a2 of
       Nothing   -> throwError "can't compare folds of different types"
       Just Refl -> do
         -- show that our knowledge is at least as strong as the assumption
-        -- TODO: this may not be quite right
-        env <- ask
+        (vars, infos) <- ask
         precondition <- lift $ lift $ forAllOf a1 $ \someA -> do
-          knowledge  <- sEval' env $ g someA
-          assumption <- sEval' env $ f someA
+          knowledge  <- sEval' vars infos $ g someA
+          assumption <- sEval' vars infos $ f someA
           pure $ knowledge ==> assumption
         lift $ lift $ constrain precondition
 
         sEval result
 
-  ListFold a1 _b1 f Add (ListInfo (FoldInfo a2 _b2 g Add result)) -> do
+  ListFold a1 _b1 f Add (ListInfo _ (FoldInfo a2 _b2 g Add result)) -> do
     case singEq a1 a2 of
       Nothing   -> throwError "can't compare folds of different types"
       Just Refl -> do
         -- The function we know about and the function we're asking about must
         -- be extensionally equal
-        env <- ask
+        (vars, infos) <- ask
         precondition <- lift $ lift $ forAllOf a1 $ \someA -> do
-          knowledge  <- sEval' env $ g someA
-          assumption <- sEval' env $ f someA
+          knowledge  <- sEval' vars infos $ g someA
+          assumption <- sEval' vars infos $ f someA
           pure $ knowledge .== assumption
         lift $ lift $ constrain precondition
 
@@ -438,7 +569,7 @@ sEval = \case
       <$> sEval (ListFold a b f fold l1)
       <*> sEval (ListFold a b f fold l2)
 
-  ListAt i (ListInfo (AtInfo j v)) -> do
+  ListAt i (ListInfo _ (AtInfo j v)) -> do
     i' <- sEval i
     j' <- sEval j
     case (unliteral i', unliteral j') of
@@ -448,9 +579,10 @@ sEval = \case
         -- TODO: we should recover from this failure as well
       _ -> throwError "couldn't get literal form of both list indices"
 
-  ListFold _ tyB _ _ (ListInfo (AtInfo _ _)) -> withSymWord tyB $ lift $ lift free_
+  ListFold _ tyB _ _ (ListInfo _ (AtInfo _ _))
+    -> withSymWord tyB $ lift $ lift free_
 
-  ListAt i (ListInfo (LitList l)) -> do
+  ListAt i (ListInfo _ (LitList l)) -> do
     i' <- sEval i
     case unliteral i' of
       Just i'' ->
@@ -474,13 +606,15 @@ sEval = \case
   SymB a -> pure $ a
   SymI a -> pure $ a
   Var ty1 a -> do
-    m <- ask
-    case Map.lookup a m of
+    (vars, _) <- ask
+    case Map.lookup a vars of
       Nothing -> throwError $ "couldn't find variable " ++ a
       Just (Exists ty2 expr) -> case singEq ty1 ty2 of
         Just Refl -> sEval expr
         Nothing -> throwError $ "variable of wrong type. expected: " ++
           show ty1 ++ ", found: " ++ show ty2
+
+  other -> error $ "todo: " ++ show other
 
 gt0 :: Expr 'IntTy -> Expr 'BoolTy
 gt0 x = Gt x 0
@@ -488,29 +622,97 @@ gt0 x = Gt x 0
 lte0 :: Expr 'IntTy -> Expr 'BoolTy
 lte0 x = Not (Gt x 0)
 
-mkTest :: Validity -> Symbolic (Expr 'BoolTy) -> Test ()
-mkTest expectValid expr = mkTest' expectValid ((Map.empty,) <$> expr)
+(<&>) :: Functor f => f a -> (a -> b) -> f b
+(<&>) = flip fmap
 
-mkTest' :: Validity -> Symbolic (Map String Existential, Expr 'BoolTy) -> Test ()
-mkTest' expectValid envExpr = do
-  let constraints = do
-        (env, expr)  <- envExpr
-        result <- runReaderT (runExceptT (sEval expr)) env
+mkTest
+  :: Validity -> Expr 'BoolTy -> Test ()
+mkTest expectValid expr = mkTest' expectValid expr (pure Map.empty)
+
+mkTest'
+  :: Validity -> Expr 'BoolTy -> Symbolic (Map String Existential) -> Test ()
+mkTest' expectValid expr sEnv = do
+  let (expr', infos) = runWriter $ evalStateT (normalizeExpr expr) 0
+
+      constraints
+        :: Symbolic (Map String Existential)
+        -> Map Int ELI
+        -> Symbolic (SBV Bool)
+      constraints sEnv' infos' = do
+        env <- sEnv'
+        result <- runReaderT (runExceptT (sEval expr')) (env, infos')
         case result of
           Left msg      -> error msg
           Right result' -> pure result'
-  (valid, vacuous) <- io $ do
-    (,) <$> isTheorem constraints <*> isVacuous constraints
 
-  io $ do
-    result <- prove constraints
-    print result
+  (valid, vacuous) <- io $ (,)
+    <$> isTheorem (constraints sEnv infos)
+    <*> isVacuous (constraints sEnv infos)
 
-  -- traceM $ "valid: "   ++ show valid
-  -- traceM $ "vacuous: " ++ show vacuous
   expect $ if expectValid == Valid
     then valid && not vacuous
     else not valid || vacuous
+
+  -- for each list info:
+  --   if it doesn't already have a concrete representation:
+  --     iteratively try every concrete list rep until we find one that
+  --     produces a falsifying model
+  --
+  -- optimization 1: exponentially increasing search, then binary search
+  -- 0 ... 1 ... 2 ... 4 ... 8 ... 16 ... 32 ... 64 ... 128 <- found example
+  --                                                ^^^ binary search here
+  --
+  -- optimization 2: extract falsifying model, feed in entirety of previously
+  -- found model as constraints for new model
+
+  -- Either index to start search at or concrete (skeleton of) counterexample
+  let concreteReps :: Map Int (Either (ETy, Int) EConcreteList)
+      concreteReps = infos <&> \(ELI ty li) -> case extractConcreteList li of
+        Nothing -> Left (ETy ty, 0)
+        Just xs -> Right $ EConcreteList ty xs
+
+  concreteResults <-
+    io $ flip execStateT concreteReps $ forM_ (Map.keys concreteReps) $ \listIx ->
+      whileM_ (do reps <- get
+                  pure $ case reps Map.! listIx of
+                    Left{}  -> True
+                    Right{} -> False) $ do
+        reps <- get
+        case reps Map.! listIx of
+          Right{} -> error "impossible"
+          Left (ETy ty, startingLen) -> do
+            let (vars, varEnv) = mkVars ty listIx startingLen
+                list = EConcreteList ty vars
+                concreteReps' = Map.update (const (Just (Right list))) listIx
+                  concreteReps
+                infos' = mergeConcreteReps infos concreteReps'
+                sEnv' = Map.union <$> sEnv <*> varEnv
+
+            (valid', vacuous') <- liftIO $ (,)
+              <$> isTheorem (constraints sEnv' infos')
+              <*> isVacuous (constraints sEnv' infos')
+
+            -- traceM $ "valid': " ++ show valid'
+            -- traceM $ "vacuous': " ++ show vacuous'
+
+            if valid' && not vacuous'
+
+            -- we failed to find a falsifying model at this length -- try a
+            -- longer list
+            then if startingLen < 50
+                 then put $ Map.insert listIx (Left (ETy ty, succ startingLen))
+                        reps
+                 else error "we probably should have found a model by now"
+
+            -- we found a model
+            else put concreteReps'
+
+--   liftIO $ do
+--     result <- prove $ constraints infos'
+--     print result
+
+  -- liftIO $ print concreteResults
+  pure ()
 
 data Validity = Valid | Invalid
   deriving Eq
@@ -518,12 +720,12 @@ data Validity = Valid | Invalid
 mkAny
   :: Sing a
   => (Expr a -> Expr 'BoolTy) -> ListInfo a -> Expr 'BoolTy
-mkAny f = bnot . ListFold sing sing (bnot . f) And . ListInfo
+mkAny f = bnot . ListFold sing sing (bnot . f) And . ListInfo sing
 
 mkAll
   :: Sing a
   => (Expr a -> Expr 'BoolTy) -> ListInfo a -> Expr 'BoolTy
-mkAll f = ListFold sing sing f And . ListInfo
+mkAll f = ListFold sing sing f And . ListInfo sing
 
 mkAnd :: ListInfo 'BoolTy -> Expr 'BoolTy
 mkAnd = mkAll id
@@ -553,149 +755,155 @@ main :: IO ()
 main = do
   let almostAllPos :: Expr ('List 'IntTy)
       almostAllPos = ListCat SInt
-        (ListInfo (allInfo gt0))
+        (ListInfo sing (allInfo gt0))
         (ListCat SInt
-          (ListInfo (allInfo (Eq SInt 0)))
-          (ListInfo (allInfo gt0)))
+          (ListInfo sing (allInfo (Eq SInt 0)))
+          (ListInfo sing (allInfo gt0)))
 
       sumTo7 :: Expr ('List 'IntTy)
       sumTo7 = ListCat SInt
-        (ListInfo (mkFoldInfo id Add 3))
-        (ListInfo (mkFoldInfo id Add 4))
+        (ListInfo sing (mkFoldInfo id Add 3))
+        (ListInfo sing (mkFoldInfo id Add 4))
 
   run $ tests
-    [ scope "any (> 0) [1, 2, 3]" $
-        mkTest Valid $ pure $ mkAny gt0 $ LitList [1, 2, 3]
+    -- [ scope "any (> 0) [1, 2, 3]" $
+    --     mkTest Valid $ pure $ mkAny gt0 $ LitList [1, 2, 3]
 
-    , scope "any (> 0) [-1, 2, 3]" $
-        mkTest Valid $ pure $ mkAny gt0 $ LitList [lit (-1), 2, 3]
+    -- , scope "any (> 0) [-1, 2, 3]" $
+    --     mkTest Valid $ pure $ mkAny gt0 $ LitList [lit (-1), 2, 3]
 
-    , scope "any (> 0) [a, -1, 3]" $ do
-        mkTest Valid $ do
-          a <- sInteger "a"
-          pure $ mkAny gt0 $ LitList [sym a, lit (-1), 3]
+    -- , scope "any (> 0) [a, -1, 3]" $ do
+    --     mkTest Valid $ do
+    --       a <- sInteger "a"
+    --       pure $ mkAny gt0 $ LitList [sym a, lit (-1), 3]
 
-    , scope "all (> 0) [a, 1, 3]" $
-      mkTest Invalid  $ do
-        a <- sInteger "a"
-        pure $ mkAll gt0 $ LitList [sym a, lit 1, 3]
+    -- , scope "all (> 0) [a, 1, 3]" $
+    --   mkTest Invalid  $ do
+    --     a <- sInteger "a"
+    --     pure $ mkAll gt0 $ LitList [sym a, lit 1, 3]
 
-    , scope "length [] == 0" $
-        mkTest Valid $ pure $ ListLen (ListInfo (LitList [])) `eq` 0
+    -- , scope "length [] == 0" $
+    --     mkTest Valid $ pure $ ListLen (ListInfo sing (LitList [])) `eq` 0
 
-    , scope "length (len 2) == 2" $
-        mkTest Valid $ do
-          [a, b] <- sIntegers ["a", "b"]
-          let lst :: Expr ('List 'IntTy)
-              lst = ListInfo $ LitList [sym a, sym b]
-          pure $ ListLen lst `eq` 2
+    -- , scope "length (len 2) == 2" $
+    --     mkTest Valid $ do
+    --       [a, b] <- sIntegers ["a", "b"]
+    --       let lst :: Expr ('List 'IntTy)
+    --           lst = ListInfo sing $ LitList [sym a, sym b]
+    --       pure $ ListLen lst `eq` 2
 
-      -- show that the result of a mapping is all positive
-    , scope "fmap (> 0) lst == true" $
-        mkTest Valid $ pure $
-          mkAll gt0 $ allInfo gt0
+    --   -- show that the result of a mapping is all positive
+    -- , scope "fmap (> 0) lst == true" $
+    --     mkTest Valid $ pure $
+    --       mkAll gt0 $ allInfo gt0
 
-    , scope "fmap (> 0) almostAllPos == true" $
-        mkTest Invalid $ pure $
-          mkFold gt0 And almostAllPos
+    -- , scope "fmap (> 0) almostAllPos == true" $
+    --     mkTest Invalid $ pure $
+    --       mkFold gt0 And almostAllPos
 
-    , scope "(and []) == true" $
-        mkTest Valid $ pure $
-          mkAnd $ LitList []
+    -- , scope "(and []) == true" $
+    --     mkTest Valid $ pure $
+    --       mkAnd $ LitList []
 
-    , scope "all (eq true) [] /= false" $ do
-        mkTest Invalid $ pure $ Not $
-          mkAnd $ LitList []
+    -- , scope "all (eq true) [] /= false" $ do
+    --     mkTest Invalid $ pure $ Not $
+    --       mkAnd $ LitList []
 
-    , scope "(and [true]) == true" $
-        mkTest Valid $ pure $
-          mkAnd $ allInfo $ eq true
+    -- , scope "(and [true]) == true" $
+    --     mkTest Valid $ pure $
+    --       mkAnd $ allInfo $ eq true
 
-    , scope "(and [false]) == true" $
-        mkTest Invalid $ pure $
-          mkAnd $ mkFoldInfo id And false
+    -- , scope "(and [false]) == true" $
+    --     mkTest Invalid $ pure $
+    --       mkAnd $ mkFoldInfo id And false
 
-    , scope "and [false] /= true" $
-        mkTest Valid $ pure $ bnot $
-          mkAnd (mkFoldInfo id And false) `eq` true
+    -- , scope "and [false] /= true" $
+    --     mkTest Valid $ pure $ bnot $
+    --       mkAnd (mkFoldInfo id And false) `eq` true
 
-    , scope "all (> 0) => (not (any (> 0)) == false)" $
-        mkTest Invalid $ pure $
-          bnot $ mkAny gt0 $ allInfo gt0
+    -- , scope "all (> 0) => (not (any (> 0)) == false)" $
+    --     mkTest Invalid $ pure $
+    --       bnot $ mkAny gt0 $ allInfo gt0
 
-    , scope "any (<= 0) => not (all (> 0))" $
-        mkTest Valid $ pure $ bnot $
-          mkAll gt0 $ mkFoldInfo (bnot . lte0) And false
+    -- , scope "any (<= 0) => not (all (> 0))" $
+    --     mkTest Valid $ pure $ bnot $
+    --       mkAll gt0 $ mkFoldInfo (bnot . lte0) And false
 
-    , scope "at 2 [1, 2, 3] == 3" $
-        mkTest Valid $ pure $
-          ListAt 2 (ListInfo (LitList [1, 2, 3])) `eq` LitI 3
+    -- , scope "at 2 [1, 2, 3] == 3" $
+    --     mkTest Valid $ pure $
+    --       ListAt 2 (ListInfo sing (LitList [1, 2, 3])) `eq` LitI 3
 
-    , scope "at 2 [1, 2, 3] == 2" $
-        mkTest Invalid $ pure $
-          ListAt 2 (ListInfo (LitList [1, 2, 3])) `eq` LitI 2
+    -- , scope "at 2 [1, 2, 3] == 2" $
+    --     mkTest Invalid $ pure $
+    --       ListAt 2 (ListInfo sing (LitList [1, 2, 3])) `eq` LitI 2
 
-    , scope "sum sumTo7 == 7" $
-        mkTest Valid $ pure $
-          mkFold id Add sumTo7
-          `eq`
-          7
+    -- , scope "sum sumTo7 == 7" $
+    --     mkTest Valid $ pure $
+    --       mkFold id Add sumTo7
+    --       `eq`
+    --       7
 
-    , scope "sum (map (const 1) [length 7]) == 7" $
-        mkTest Valid $ do
-          elems <- sIntegers ["a", "b", "c", "d", "e", "f", "g"]
-          let lst :: Expr ('List 'IntTy)
-              lst = ListInfo $ LitList $ sym <$> elems
-          pure $
-            mkFold (const 1) Add lst
-            `eq`
-            7
+    -- , scope "sum (map (const 1) [length 7]) == 7" $
+    --     mkTest Valid $ do
+    --       elems <- sIntegers ["a", "b", "c", "d", "e", "f", "g"]
+    --       let lst :: Expr ('List 'IntTy)
+    --           lst = ListInfo sing $ LitList $ sym <$> elems
+    --       pure $
+    --         mkFold (const 1) Add lst
+    --         `eq`
+    --         7
 
-    , scope "sum (map (const 1) [length 3 || length 4] > 2" $
-        mkTest Valid $ do
-          [a, b, c, d, e, f, g] <- sIntegers ["a", "b", "c", "d", "e", "f", "g"]
-          let lst :: Expr ('List 'IntTy)
-              lst = ListInfo $ OrInfo
-                (LitList $ sym <$> [a, b, c])
-                (LitList $ sym <$> [d, e, f, g])
-          pure $
-            mkFold (const 1) Add lst
-            `Gt`
-            2
+    -- , scope "sum (map (const 1) [length 3 || length 4] > 2" $
+    --     mkTest Valid $ do
+    --       [a, b, c, d, e, f, g] <- sIntegers ["a", "b", "c", "d", "e", "f", "g"]
+    --       let lst :: Expr ('List 'IntTy)
+    --           lst = ListInfo sing $ OrInfo
+    --             (LitList $ sym <$> [a, b, c])
+    --             (LitList $ sym <$> [d, e, f, g])
+    --       pure $
+    --         mkFold (const 1) Add lst
+    --         `Gt`
+    --         2
 
-    , scope "sum (map (const 1) [length 3 && at 2 == 1000] == 3" $
-        mkTest' Valid $ do
+    -- , scope "sum (map (const 1) [length 3 && at 2 == 1000] == 3" $
+    --     mkTest' Valid $ do
+    --       [ai, bi, ci] <- sIntegers ["a", "b", "c"]
+    --       let lst :: Expr ('List 'IntTy)
+    --           lst = ListInfo sing $ AndInfo
+    --             (LitList [VarI "a", VarI "b", VarI "c"])
+    --             (AtInfo 2 1000)
+    --           m = Map.fromList
+    --             [ ("a", Exists SInt $ SymI ai)
+    --             , ("b", Exists SInt $ SymI bi)
+    --             , ("c", Exists SInt $ SymI ci)
+    --             ]
+    --           expr = mkFold (const 1) Add lst
+    --             `eq`
+    --             3
+
+    --       pure (m, expr)
+
+    [ scope "sum [length 3 && at 2 == 1000] == 3" $
+        mkTest' Invalid
+          (let lst :: Expr ('List 'IntTy)
+               lst = ListInfo sing $ AndInfo
+                 (LitList [VarI "a", VarI "b", VarI "c"])
+                 (AtInfo 2 1000)
+           in mkFold id Add lst `eq` 3) $ do
           [ai, bi, ci] <- sIntegers ["a", "b", "c"]
-          let lst :: Expr ('List 'IntTy)
-              lst = ListInfo $ AndInfo
-                (LitList [VarI "a", VarI "b", VarI "c"])
-                (AtInfo 2 1000)
-              m = Map.fromList
-                [ ("a", Exists SInt $ SymI ai)
-                , ("b", Exists SInt $ SymI bi)
-                , ("c", Exists SInt $ SymI ci)
-                ]
-              expr = mkFold (const 1) Add lst
-                `eq`
-                3
+          pure $ Map.fromList
+            [ ("a", Exists SInt $ SymI ai)
+            , ("b", Exists SInt $ SymI bi)
+            , ("c", Exists SInt $ SymI ci)
+            ]
 
-          pure (m, expr)
-
-    , scope "sum [length 3 && at 2 == 1000] == 3" $
-        mkTest' Invalid $ do
-          [ai, bi, ci] <- sIntegers ["a", "b", "c"]
+    , scope "sum [at 2 == 1000] == 3" $
+        mkTest Invalid $
           let lst :: Expr ('List 'IntTy)
-              lst = ListInfo $ AndInfo
-                (LitList [VarI "a", VarI "b", VarI "c"])
-                (AtInfo 2 1000)
-              m = Map.fromList
-                [ ("a", Exists SInt $ SymI ai)
-                , ("b", Exists SInt $ SymI bi)
-                , ("c", Exists SInt $ SymI ci)
-                ]
+              lst = ListInfo sing $ AtInfo 2 1000
               expr = mkFold id Add lst
                 `eq`
                 3
 
-          pure (m, expr)
+          in expr
     ]
