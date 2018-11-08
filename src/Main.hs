@@ -75,37 +75,40 @@ instance Show ETy where
       showString "ETy "
     . showsPrec 11 ty
 
-data Existential where
-  Exists :: SingTy ty -> Expr ty -> Existential
+data Existential tm where
+  Exists :: SingTy ty -> tm ty -> Existential tm
 
-instance Show Existential where
+type EExpr = Existential Expr
+
+instance Show EExpr where
   showsPrec p (Exists ty expr) = showParen (p > 10) $
       showString "Exists "
     . showsPrec 11 ty
     . showString " "
     . showsPrec 11 expr
 
-data ELI where
-  ELI :: SingTy ty -> ListInfo ty -> ELI
+type ELI = Existential ListInfo
 
 instance Show ELI where
-  showsPrec p (ELI ty info) = showParen (p > 10) $
-      showString "ELI "
+  showsPrec p (Exists ty info) = showParen (p > 10) $
+      showString "Exists "
     . showsPrec 11 ty
     . showString " "
     . showsPrec 11 info
 
-data EConcreteList where
-  EConcreteList :: SingTy ty -> [Expr ty] -> EConcreteList
+newtype ConcreteList ty = ConcreteList [Expr ty]
+  deriving Show
+
+type EConcreteList = Existential ConcreteList
 
 instance Show EConcreteList where
-  showsPrec p (EConcreteList ty list) = showParen (p > 10) $
-      showString "EConcreteList "
+  showsPrec p (Exists ty list) = showParen (p > 10) $
+      showString "Exists "
     . showsPrec 11 ty
     . showString " "
     . showsPrec 11 list
 
-example :: Existential
+example :: EExpr
 example = Exists (SList SInt) (ListInfo sing (LitList [1, 2, 3]))
 
 class Sing ty where
@@ -187,7 +190,7 @@ normalizeExpr tm = case tm of
   NormalListInfo{} -> pure tm
   ListInfo ty i -> do
     pos <- id <<+= 1
-    tell $ Map.singleton pos $ ELI ty i
+    tell $ Map.singleton pos $ Exists ty i
     pure $ NormalListInfo ty pos
 
 mergeConcreteReps
@@ -195,16 +198,16 @@ mergeConcreteReps
   -> [(Either (ETy, Int) EConcreteList)]
   -> [ELI]
 mergeConcreteReps elis econs = zipWith
-  (\eli@(ELI ty1 li) econ -> case econ of
+  (\eli@(Exists ty1 li) econ -> case econ of
     Left _ -> eli -- we haven't started concretizing this list yet
-    Right (EConcreteList ty2 list) -> case singEq ty1 ty2 of
+    Right (Exists ty2 (ConcreteList list)) -> case singEq ty1 ty2 of
       Nothing   -> error "impossible"
-      Just Refl -> ELI ty1 (AndInfo li (LitList list)))
+      Just Refl -> Exists ty1 (AndInfo li (LitList list)))
   elis econs
 
 mkVars
   :: SingTy ty -> Int -> Int
-  -> ([Expr ty], [(String, ETy)], Symbolic (Map String Existential))
+  -> ([Expr ty], [(String, ETy)], Symbolic (Map String EExpr))
 mkVars ty listIx len =
   let varName exprIx = "var_" ++ show listIx ++ "_" ++ show exprIx
       exprs     = Var ty    . varName <$> [0..len]
@@ -217,7 +220,7 @@ mkVars ty listIx len =
              _     -> error "unsupported var type"
   in (exprs, typedVars, env)
 
-extractVars :: Modelable a => a -> [(String, ETy)] -> Map String Existential
+extractVars :: Modelable a => a -> [(String, ETy)] -> Map String EExpr
 extractVars model names
   = let f = \case
           (name, ETy SInt)  -> (name, Exists SInt  . LitI <$> getModelValue name model)
@@ -227,7 +230,7 @@ extractVars model names
         concatMap (\case { (name, Just x) -> [(name, x)];  _ -> [] }) $
         fmap f names
 
-existentialTy :: Existential -> ETy
+existentialTy :: Existential tm -> ETy
 existentialTy (Exists ty _) = ETy ty
 
 symOf :: SingTy ty -> SBV (Concrete ty) -> Expr ty
@@ -487,7 +490,7 @@ forceRight (Left _) = error "unexpected left"
 forceRight (Right b) = b
 
 sEval'
- :: Map String Existential
+ :: Map String EExpr
  -> [ELI]
  -> Expr ty
  -> Symbolic (SBV (Concrete ty))
@@ -495,14 +498,14 @@ sEval' vars infos x
   = forceRight <$> runReaderT (runExceptT (sEval x)) (vars, infos)
 
 type SEval ty = ExceptT String
-  (ReaderT (Map String Existential, [ELI])
+  (ReaderT (Map String EExpr, [ELI])
   Symbolic) ty
 
 viewInfo :: SingTy a -> Int -> SEval (ListInfo a)
 viewInfo ty pos = do
   (_, infos) <- ask
   case infos !! pos of
-    ELI ty' li -> case singEq ty ty' of
+    Exists ty' li -> case singEq ty ty' of
       Nothing   -> throwError "got list info of wrong type"
       Just Refl -> pure li
 
@@ -669,20 +672,20 @@ runNormalize expr =
 
 type SearchEnv =
   ( [Either (ETy, Int) EConcreteList]
-  , Map String Existential
+  , Map String EExpr
   )
 
 searchListSkeletons :: Lens' SearchEnv [Either (ETy, Int) EConcreteList]
 searchListSkeletons = _1
 
-searchVariableMapping :: Lens' SearchEnv (Map String Existential)
+searchVariableMapping :: Lens' SearchEnv (Map String EExpr)
 searchVariableMapping = _2
 
 mkConstraints
-  :: Symbolic (Map String Existential)
+  :: Symbolic (Map String EExpr)
   -> [ELI]
   -> Expr 'BoolTy
-  -> Map String Existential
+  -> Map String EExpr
   -> Symbolic (SBV Bool)
 mkConstraints sEnv infos expr concreteVars = do
   env <- sEnv
@@ -705,7 +708,7 @@ mkConstraints sEnv infos expr concreteVars = do
     Right result' -> pure result'
 
 mkTest'
-  :: Validity -> Expr 'BoolTy -> Symbolic (Map String Existential) -> Test ()
+  :: Validity -> Expr 'BoolTy -> Symbolic (Map String EExpr) -> Test ()
 mkTest' expectValid expr sEnv = do
   let (expr', infos)     = runNormalize expr
       initialAssignments = Map.empty
@@ -732,10 +735,10 @@ mkTest' expectValid expr sEnv = do
 
   -- Either index to start search at or concrete (skeleton of) counterexample
   let listSkeletons :: [Either (ETy, Int) EConcreteList]
-      listSkeletons = infos <&> \(ELI ty li) -> case extractConcreteList li of
+      listSkeletons = infos <&> \(Exists ty li) -> case extractConcreteList li of
         Nothing            -> Left (ETy ty, 0)
         Just (Right start) -> Left (ETy ty, start)
-        Just (Left xs)     -> Right $ EConcreteList ty xs
+        Just (Left xs)     -> Right $ Exists ty $ ConcreteList xs
       initialState       = (listSkeletons, initialAssignments)
       numLists           = length listSkeletons
 
@@ -749,7 +752,7 @@ mkTest' expectValid expr sEnv = do
             variableMapping <- use searchVariableMapping
 
             let (vars, typedVars, varEnv) = mkVars ty listIx startingLen
-                listElemVars = EConcreteList ty vars
+                listElemVars = Exists ty $ ConcreteList vars
                 constraints = mkConstraints sEnv infos expr' variableMapping
 
             (valid', vacuous') <- liftIO $
