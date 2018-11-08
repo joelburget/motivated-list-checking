@@ -755,8 +755,8 @@ mkTest' expectValid expr sEnv = do
                 listElemVars = Exists ty $ ConcreteList vars
                 constraints = mkConstraints sEnv infos expr' variableMapping
 
-            (valid', vacuous') <- liftIO $
-              (,) <$> isTheorem constraints <*> isVacuous constraints
+            valid'   <- liftIO $ isTheorem constraints
+            vacuous' <- liftIO $ isVacuous constraints
 
             if valid' && not vacuous'
 
@@ -764,7 +764,8 @@ mkTest' expectValid expr sEnv = do
             -- longer list
             then
               if startingLen < 50
-              then modify $ searchListSkeletons . ix listIx .~ Left (ETy ty, succ startingLen)
+              then modify $ searchListSkeletons . ix listIx .~
+                     Left (ETy ty, succ startingLen)
               else error "we probably should have found a model by now"
 
             -- we found a model
@@ -789,7 +790,7 @@ mkTest' expectValid expr sEnv = do
               liftIO $ putStrLn $ "extractedVars: " ++ show extractedVars
               searchVariableMapping <>= extractedVars
 
-  -- liftIO $ print (fst concreteResults :: [Either (ETy, Int) EConcreteList])
+  liftIO $ putStrLn $ "concreteResults: " ++ show concreteResults
   pure ()
 
 data Validity = Valid | Invalid
