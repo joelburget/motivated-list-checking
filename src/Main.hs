@@ -30,7 +30,6 @@ import Data.Foldable (foldrM)
 import Control.Monad.Except
 import           Data.SBV
 import           Data.SBV.List ((.++))
--- import           Data.SBV.Control hiding (io)
 import           EasyTest
 import           Prelude       as P hiding (concat, init)
 import Data.List (find)
@@ -78,6 +77,13 @@ instance Show ETy where
 
 data Existential where
   Exists :: SingTy ty -> Expr ty -> Existential
+
+instance Show Existential where
+  showsPrec p (Exists ty expr) = showParen (p > 10) $
+      showString "Exists "
+    . showsPrec 11 ty
+    . showString " "
+    . showsPrec 11 expr
 
 data ELI where
   ELI :: SingTy ty -> ListInfo ty -> ELI
@@ -197,17 +203,32 @@ mergeConcreteReps elis econs = zipWith
   elis econs
 
 mkVars
-  :: SingTy ty -> Int -> Int -> ([Expr ty], Symbolic (Map String Existential))
+  :: SingTy ty -> Int -> Int
+  -> ([Expr ty], [(String, ETy)], Symbolic (Map String Existential))
 mkVars ty listIx len =
   let varName exprIx = "var_" ++ show listIx ++ "_" ++ show exprIx
-      exprs = [0..len] <&> \exprIx -> Var ty $ varName exprIx
+      exprs     = Var ty    . varName <$> [0..len]
+      typedVars = (,ETy ty) . varName <$> [0..len]
       env = fmap Map.fromList $ forM [0..len] $ \exprIx ->
         let name = varName exprIx
         in (name,) <$> case ty of
              SInt  -> Exists ty . SymI <$> sInteger name
              SBool -> Exists ty . SymB <$> sBool name
              _     -> error "unsupported var type"
-  in (exprs, env)
+  in (exprs, typedVars, env)
+
+extractVars :: Modelable a => a -> [(String, ETy)] -> Map String Existential
+extractVars model names
+  = let f = \case
+          (name, ETy SInt)  -> (name, Exists SInt  . LitI <$> getModelValue name model)
+          (name, ETy SBool) -> (name, Exists SBool . LitB <$> getModelValue name model)
+          _                 -> error "unexpected type"
+    in Map.fromList $
+        concatMap (\case { (name, Just x) -> [(name, x)];  _ -> [] }) $
+        fmap f names
+
+existentialTy :: Existential -> ETy
+existentialTy (Exists ty _) = ETy ty
 
 symOf :: SingTy ty -> SBV (Concrete ty) -> Expr ty
 symOf (SList _) _ = error "we don't support symbolic lists"
@@ -290,17 +311,24 @@ data ListInfo (ty :: Ty) where
     -> ListInfo a
 
   AtInfo :: Expr 'IntTy -> Expr a -> ListInfo a
+  LenGt :: Int -> ListInfo a
 
   OrInfo  :: ListInfo a -> ListInfo a -> ListInfo a
   AndInfo :: ListInfo a -> ListInfo a -> ListInfo a
 
-extractConcreteList :: ListInfo ty -> Maybe [Expr ty]
+extractConcreteList :: ListInfo ty -> Maybe (Either [Expr ty] Int)
 extractConcreteList = \case
-  LitList lst -> Just lst
-  FoldInfo{} -> Nothing
-  AtInfo{} -> Nothing
-  OrInfo{} -> Nothing
-  AndInfo a b -> extractConcreteList a <|> extractConcreteList b
+  LitList lst -> Just (Left lst)
+  FoldInfo{}  -> Nothing
+  AtInfo{}    -> Nothing
+  LenGt len   -> Just (Right len)
+  OrInfo{}    -> Nothing
+  AndInfo a b -> extractConcreteList a `choose` extractConcreteList b
+
+  -- prefer left over right, otherwise take either Just
+  where choose (Just l@Left{}) _               = Just l
+        choose _               (Just l@Left{}) = Just l
+        choose x               y               = x <|> y
 
 allInfo :: (Sing a, b ~ 'BoolTy) => (Expr a -> Expr b) -> ListInfo a
 allInfo f = FoldInfo sing SBool f And (LitB True)
@@ -324,6 +352,9 @@ instance Show (ListInfo ty) where
       . showsPrec 11 i
       . showString " "
       . showsPrec 11 a
+    LenGt i ->
+        showString "LenGt "
+      . showsPrec 11 i
     OrInfo a b ->
         showString "OrInfo "
       . showsPrec 11 a
@@ -475,6 +506,9 @@ viewInfo ty pos = do
       Nothing   -> throwError "got list info of wrong type"
       Just Refl -> pure li
 
+undetermined :: SingTy ty -> SEval (SBV (Concrete ty))
+undetermined ty = withSymWord ty $ lift $ lift free_
+
 sEval :: forall ty. Expr ty -> SEval (SBV (Concrete ty))
 sEval = \case
   ListCat SBool a b     -> (.++) <$> sEval a <*> sEval b
@@ -508,6 +542,10 @@ sEval = \case
     pure a'
 
   ListLen (ListInfo _ (LitList l)) -> pure $ literal $ fromIntegral $ length l
+  ListLen (ListInfo _ (LenGt len)) -> do
+    x <- lift $ lift free_
+    lift $ lift $ constrain $ x .> fromIntegral len
+    pure x
 
   ListFold tyA tyB f fold (ListInfo ty (OrInfo a b)) -> withSymWord tyB $ do
     x <- lift $ lift free_
@@ -574,8 +612,9 @@ sEval = \case
         -- TODO: we should recover from this failure as well
       _ -> throwError "couldn't get literal form of both list indices"
 
-  ListFold _ tyB _ _ (ListInfo _ (AtInfo _ _))
-    -> withSymWord tyB $ lift $ lift free_
+  ListFold _ tyB _ _ (ListInfo _ (AtInfo _ _))         -> undetermined tyB
+  ListFold _ tyB _ _ (ListInfo _ (LenGt _))            -> undetermined tyB
+  ListFold _ tyB _ _ (ListInfo _ (FoldInfo _ _ _ _ _)) -> undetermined tyB
 
   ListAt i (ListInfo _ (LitList l)) -> do
     i' <- sEval i
@@ -628,25 +667,52 @@ runNormalize expr =
       infos' = [0..maxIx] <&> \pos -> infos Map.! pos
   in (expr', infos')
 
+type SearchEnv =
+  ( [Either (ETy, Int) EConcreteList]
+  , Map String Existential
+  )
+
+searchListSkeletons :: Lens' SearchEnv [Either (ETy, Int) EConcreteList]
+searchListSkeletons = _1
+
+searchVariableMapping :: Lens' SearchEnv (Map String Existential)
+searchVariableMapping = _2
+
+mkConstraints
+  :: Symbolic (Map String Existential)
+  -> [ELI]
+  -> Expr 'BoolTy
+  -> Map String Existential
+  -> Symbolic (SBV Bool)
+mkConstraints sEnv infos expr concreteVars = do
+  env <- sEnv
+  ifor_ concreteVars $ \name (Exists (ty :: SingTy ty) concreteExpr) ->
+    case env ^. singular (ix name) of
+      Exists ty' envExpr -> case singEq ty ty' of
+        Nothing -> (error "bad" :: Symbolic ())
+        Just Refl -> do
+          concreteValue <-
+            runReaderT (runExceptT (sEval concreteExpr)) (env, infos)
+          envValue <-
+            runReaderT (runExceptT (sEval envExpr)) (env, infos)
+          case (concreteValue, envValue) of
+            (Right concreteValue', Right envValue') ->
+              constrain $ concreteValue' .== envValue'
+            _ -> error "bad"
+  result <- runReaderT (runExceptT (sEval expr)) (env, infos)
+  case result of
+    Left msg      -> error msg
+    Right result' -> pure result'
+
 mkTest'
   :: Validity -> Expr 'BoolTy -> Symbolic (Map String Existential) -> Test ()
 mkTest' expectValid expr sEnv = do
-  let (expr', infos) = runNormalize expr
+  let (expr', infos)     = runNormalize expr
+      initialAssignments = Map.empty
+      constraints0       = mkConstraints sEnv infos expr' initialAssignments
 
-      constraints
-        :: Symbolic (Map String Existential)
-        -> [ELI]
-        -> Symbolic (SBV Bool)
-      constraints sEnv' infos' = do
-        env <- sEnv'
-        result <- runReaderT (runExceptT (sEval expr')) (env, infos')
-        case result of
-          Left msg      -> error msg
-          Right result' -> pure result'
-
-  (valid, vacuous) <- io $ (,)
-    <$> isTheorem (constraints sEnv infos)
-    <*> isVacuous (constraints sEnv infos)
+  valid   <- io $ isTheorem constraints0
+  vacuous <- io $ isVacuous constraints0
 
   expect $ if expectValid == Valid
     then valid && not vacuous
@@ -661,56 +727,66 @@ mkTest' expectValid expr sEnv = do
   -- 0 ... 1 ... 2 ... 4 ... 8 ... 16 ... 32 ... 64 ... 128 <- found example
   --                                                ^^^ binary search here
   --
-  -- optimization 2: extract falsifying model, feed in entirety of previously
-  -- found model as constraints for new model
+  -- optimization 2 (done): extract falsifying model, feed in entirety of
+  -- previously found model as constraints for new model
 
   -- Either index to start search at or concrete (skeleton of) counterexample
-  let concreteReps :: [Either (ETy, Int) EConcreteList]
-      concreteReps = infos <&> \(ELI ty li) -> case extractConcreteList li of
-        Nothing -> Left (ETy ty, 0)
-        Just xs -> Right $ EConcreteList ty xs
-      numLists = length concreteReps
+  let listSkeletons :: [Either (ETy, Int) EConcreteList]
+      listSkeletons = infos <&> \(ELI ty li) -> case extractConcreteList li of
+        Nothing            -> Left (ETy ty, 0)
+        Just (Right start) -> Left (ETy ty, start)
+        Just (Left xs)     -> Right $ EConcreteList ty xs
+      initialState       = (listSkeletons, initialAssignments)
+      numLists           = length listSkeletons
 
-  concreteResults <-
-    io $ flip execStateT concreteReps $ forM_ [0..numLists - 1] $ \listIx ->
-      whileM_ (isn't _Right <$> use (singular (ix listIx))) $ do
-        rep <- use $ singular $ ix listIx
+  concreteResults <- io $
+    flip execStateT initialState $ forM_ [0..numLists - 1] $ \listIx ->
+      whileM_ (isn't _Right <$> use (singular (searchListSkeletons . ix listIx))) $ do
+        rep <- use $ singular $ searchListSkeletons . ix listIx
         case rep of
           Right{} -> error "impossible"
           Left (ETy ty, startingLen) -> do
-            let (vars, varEnv) = mkVars ty listIx startingLen
-                list = EConcreteList ty vars
-                concreteReps' = concreteReps & ix listIx .~ Right list
-                infos' = mergeConcreteReps infos concreteReps'
-                sEnv' = Map.union <$> sEnv <*> varEnv
+            variableMapping <- use searchVariableMapping
 
-            (valid', vacuous') <- liftIO $ (,)
-              <$> isTheorem (constraints sEnv' infos')
-              <*> isVacuous (constraints sEnv' infos')
+            let (vars, typedVars, varEnv) = mkVars ty listIx startingLen
+                listElemVars = EConcreteList ty vars
+                constraints = mkConstraints sEnv infos expr' variableMapping
 
-            -- traceM $ "valid': " ++ show valid'
-            -- traceM $ "vacuous': " ++ show vacuous'
-
-            -- liftIO $ do
-            --   result <- prove $ constraints sEnv' infos'
-            --   print result
+            (valid', vacuous') <- liftIO $
+              (,) <$> isTheorem constraints <*> isVacuous constraints
 
             if valid' && not vacuous'
 
             -- we failed to find a falsifying model at this length -- try a
             -- longer list
-            then if startingLen < 50
-                 then modify $ ix listIx .~ Left (ETy ty, succ startingLen)
-                 else error "we probably should have found a model by now"
+            then
+              if startingLen < 50
+              then modify $ searchListSkeletons . ix listIx .~ Left (ETy ty, succ startingLen)
+              else error "we probably should have found a model by now"
 
             -- we found a model
-            else put concreteReps'
+            else do
+              let listSkeletons' = listSkeletons
+                    & ix listIx .~ Right listElemVars
+                  sEnv'  = Map.union <$> sEnv <*> varEnv
 
-  -- liftIO $ do
-  --   result <- prove $ constraints _ _
-  --   print result
+                  -- merge in learned concretizations
+                  infos' = mergeConcreteReps infos listSkeletons'
 
-  -- liftIO $ print concreteResults
+                  constraints' = mkConstraints sEnv' infos' expr' variableMapping
+              searchListSkeletons .= listSkeletons'
+
+              -- for each variable in the list we just found, extract its
+              -- concrete rep
+              extractedVars <- liftIO $ do
+                result <- prove constraints'
+                -- print result
+                -- putStrLn $ "typedVars: " ++ show typedVars
+                pure $ extractVars result typedVars
+              liftIO $ putStrLn $ "extractedVars: " ++ show extractedVars
+              searchVariableMapping <>= extractedVars
+
+  -- liftIO $ print (fst concreteResults :: [Either (ETy, Int) EConcreteList])
   pure ()
 
 data Validity = Valid | Invalid
@@ -896,13 +972,29 @@ main = do
             , ("c", Exists SInt $ SymI ci)
             ]
 
-    , scope "sum [at 2 == 1000] == 3" $
+    , scope "sum [at 2 == 1000 && len > 3] == 3" $
         mkTest Invalid $
           let lst :: Expr ('List 'IntTy)
-              lst = ListInfo sing $ AtInfo 2 1000
+              lst = ListInfo sing $ AndInfo
+                (AtInfo 2 1000)
+                (LenGt 3)
               expr = mkFold id Add lst
                 `eq`
                 3
+
+          in expr
+
+    , scope "sum [all (eq 1)] == 21" $
+        mkTest Invalid $
+          let lst :: Expr ('List 'IntTy)
+              lst = ListInfo sing $ FoldInfo SInt SBool (`eq` 1) And true
+
+              -- AndInfo
+              --   (AtInfo 2 1000)
+              --   (LenGt 3)
+              expr = mkFold id Add lst
+                `eq`
+                21
 
           in expr
     ]
