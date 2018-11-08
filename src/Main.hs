@@ -123,14 +123,6 @@ instance Sing 'IntTy where
 instance Sing a => Sing ('List a) where
   sing = SList sing
 
-withEq :: forall a r. SingTy a -> (Eq (Concrete a) => r) -> r
-withEq ty = withDict dict
-  where dict :: Dict (Eq (Concrete a))
-        dict = case ty of
-          SInt    -> Dict
-          SBool   -> Dict
-          SList a -> withEq a $ Dict
-
 withSymWord :: forall a r. SingTy a -> (SymWord (Concrete a) => r) -> r
 withSymWord ty f = case ty of
   SInt    -> withDict (Dict :: Dict (SymWord (Concrete a))) f
